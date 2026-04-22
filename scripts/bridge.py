@@ -66,6 +66,10 @@ class Bridge:
             on_room_message=self._on_matrix_message,
         )
         self._stop = asyncio.Event()
+        # Global lock so Viber UIA operations never overlap. Without this,
+        # a user command like !addchat racing against the poll loop both
+        # try to drive Viber's UI at once and neither succeeds.
+        self._viber_lock = asyncio.Lock()
 
     # ---- Startup -----------------------------------------------------
     async def start(self):
@@ -117,10 +121,21 @@ class Bridge:
 
     # ---- Viber poll loop ---------------------------------------------
     async def _viber_loop(self):
-        interval = self.cfg["viber"].get("poll_interval_seconds", 3)
+        # Polling is OPT-IN and OFF by default because each poll navigates
+        # to every mapped chat in Viber — that steals focus from the user.
+        # Set bridge.poll_enabled: true in config.yaml to enable.
+        # Minimum 30s interval to avoid focus-thrashing.
+        if not self.cfg["bridge"].get("poll_enabled", False):
+            log.info("poll loop disabled (set bridge.poll_enabled: true to enable)")
+            while not self._stop.is_set():
+                await asyncio.sleep(60)
+            return
+        interval = max(int(self.cfg["bridge"].get("poll_interval_seconds", 60)), 30)
+        log.info("poll loop enabled, interval=%ds", interval)
         while not self._stop.is_set():
             try:
-                await self._scan_viber()
+                async with self._viber_lock:
+                    await self._scan_viber()
             except ViberError as e:
                 log.warning("viber error: %s — will retry", e)
                 self.viber.window = None
@@ -183,14 +198,22 @@ class Bridge:
         h = hash_msg(viber_name, "me", body)
         await self.state.mark_seen(h, "matrix->viber")
 
-        try:
-            ok = self.viber.send_message(viber_name, body)
-            if not ok:
-                await self.matrix.send_notice(
-                    room_id, f"⚠️ failed to deliver to Viber chat {viber_name!r}"
-                )
-        except ViberError as e:
-            await self.matrix.send_notice(room_id, f"⚠️ Viber error: {e}")
+        # Hold the viber lock so we don't race with the poll loop or another
+        # control-room command.
+        async with self._viber_lock:
+            try:
+                ok = await asyncio.to_thread(self.viber.send_message, viber_name, body)
+                if not ok:
+                    await self.matrix.send_notice(
+                        room_id, f"⚠️ failed to deliver to Viber chat {viber_name!r}"
+                    )
+            except ViberError as e:
+                await self.matrix.send_notice(room_id, f"⚠️ Viber error: {e}")
+
+    async def _viber_call(self, fn, *fargs, **fkwargs):
+        """Run a (synchronous) Viber operation under the lock, off the event loop."""
+        async with self._viber_lock:
+            return await asyncio.to_thread(fn, *fargs, **fkwargs)
 
     # ---- Control-room commands ---------------------------------------
     async def _on_control(self, cmd: str, args: list[str], sender: str) -> str | None:
@@ -239,8 +262,8 @@ class Bridge:
             existing = await self.state.get_room_for_viber(vname)
             if existing:
                 return f"already paired: {vname!r} → {existing}"
-            # Verify we can actually reach that chat before creating a room
-            if not self.viber.open_conversation_by_search(vname):
+            opened = await self._viber_call(self.viber.open_conversation_by_search, vname)
+            if not opened:
                 return f"could not find a Viber chat matching {vname!r}"
             room_id = await self.matrix.create_bridge_room(vname)
             await self.state.set_mapping(vname, room_id)
@@ -252,8 +275,9 @@ class Bridge:
             existing = await self.state.get_room_for_viber(vname)
             if existing:
                 return f"already paired: {vname!r} → {existing}"
-            # Don't navigate — just check if a chat is currently open
-            msgs = self.viber.read_current_chat_messages(limit=3, conversation_label=vname)
+            msgs = await self._viber_call(
+                self.viber.read_current_chat_messages, 3, vname
+            )
             if not msgs:
                 return ("no chat appears to be currently open in Viber. "
                         "Click the chat you want to pair, then run this again.")
@@ -263,7 +287,7 @@ class Bridge:
             return (f"paired currently-open Viber chat as {vname!r} → {room_id}\n"
                     f"Last messages seen:\n  {preview}")
         if cmd == "readhere":
-            msgs = self.viber.read_current_chat_messages(limit=10)
+            msgs = await self._viber_call(self.viber.read_current_chat_messages, 10)
             if not msgs:
                 return "no chat open in Viber, or messages not accessible"
             lines = [f"{len(msgs)} message(s) in the currently-open chat:"]
@@ -276,12 +300,12 @@ class Bridge:
                 return "usage: !test <viber contact or group name>"
             vname = " ".join(args)
             try:
-                opened = self.viber.open_conversation_by_search(vname)
+                opened = await self._viber_call(self.viber.open_conversation_by_search, vname)
                 if not opened:
                     return f"could not open {vname!r}"
-                msgs = self.viber.read_new_messages(vname, limit=5)
+                msgs = await self._viber_call(self.viber.read_new_messages, vname, 5)
                 if not msgs:
-                    return f"opened {vname!r} but no messages read (check MESSAGE_ITEM selector)"
+                    return f"opened {vname!r} but no messages read"
                 lines = [f"opened {vname!r}, read {len(msgs)} recent message(s):"]
                 for m in msgs[-5:]:
                     d = "→" if m.outgoing else "←"
@@ -305,10 +329,19 @@ class Bridge:
         if cmd == "reload":
             try:
                 self.viber.window = None
-                self.viber.attach()
+                await self._viber_call(self.viber.attach)
                 return "reattached to Viber"
             except ViberError as e:
                 return f"failed: {e}"
+        if cmd == "poll":
+            # Toggle the poll loop at runtime. NOT persistent across restarts.
+            if not args or args[0] not in ("on", "off", "status"):
+                return "usage: !poll on|off|status"
+            if args[0] == "status":
+                return f"poll_enabled = {self.cfg['bridge'].get('poll_enabled', False)}"
+            self.cfg["bridge"]["poll_enabled"] = (args[0] == "on")
+            return (f"poll_enabled set to {self.cfg['bridge']['poll_enabled']} "
+                    f"(takes effect on next poll cycle; restart for config file to reflect)")
         return f"unknown command: {cmd}"
 
     # ---- Housekeeping -------------------------------------------------

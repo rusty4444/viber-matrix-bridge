@@ -26,6 +26,12 @@ bridge:
   startup_message: "Viber bridge online"             # posted to control room on start
   max_backfill_per_chat: 5                           # messages to read on first sight of a chat
   room_per_chat: true                                # true = one Matrix room per Viber chat
+  # Poll loop is OFF by default. When enabled, the bridge navigates to every
+  # mapped Viber chat on every interval to check for new messages — this
+  # steals focus from Viber. Leave off for interactive use; turn on when
+  # you're willing to let the bridge drive Viber.
+  poll_enabled: false
+  poll_interval_seconds: 60                          # minimum 30s
 
 # Optional: LLM fallback for unexpected UI states (off by default)
 llm_fallback:
