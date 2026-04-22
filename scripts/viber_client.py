@@ -733,6 +733,54 @@ class ViberClient:
         log.info("read_new_messages(%r): %d FeedDelegate visible", name, len(items))
         items = items[-limit:]
 
+        # Geometry-based direction detection. Viber right-aligns outgoing
+        # bubbles and left-aligns incoming ones, but never exposes that in
+        # UIA class/id. We derive the chat pane's horizontal span from the
+        # widest visible FeedDelegate row (delegates span the full chat-pane
+        # width even when the bubble inside is right- or left-aligned).
+        # A bubble whose *center* sits clearly in the right half of that
+        # span is outgoing. Fall back to window geometry, then to None.
+        pane_left: float | None = None
+        pane_right: float | None = None
+        try:
+            # Widest row = most likely the full pane width. Delegate rows in
+            # Qt tend to be uniform width across the chat; picking the max
+            # width survives edge-cases like a single very-narrow bubble.
+            widest = None
+            widest_w = 0
+            for c in items:
+                br = c.BoundingRectangle
+                w = br.right - br.left
+                if w > widest_w:
+                    widest_w = w
+                    widest = br
+            if widest is not None and widest_w > 100:
+                pane_left = float(widest.left)
+                pane_right = float(widest.right)
+        except Exception:
+            pass
+        if pane_left is None or pane_right is None:
+            try:
+                wr = self.window.BoundingRectangle
+                # Chat pane is the right ~70% of the window (left ~30% is the
+                # conversation list). This is approximate but good enough to
+                # decide left-vs-right alignment within the pane.
+                pane_left = float(wr.left) + 0.30 * (wr.right - wr.left)
+                pane_right = float(wr.right)
+            except Exception:
+                pane_left = None
+                pane_right = None
+        pane_mid_x: float | None = (
+            (pane_left + pane_right) / 2.0
+            if pane_left is not None and pane_right is not None
+            else None
+        )
+        pane_width: float = (
+            (pane_right - pane_left)
+            if pane_left is not None and pane_right is not None
+            else 0.0
+        )
+
         messages: list[ViberMessage] = []
         for feed in items:
             # Descend to the TextEditItem grandchild to read the message text.
@@ -758,6 +806,26 @@ class ViberClient:
                 continue
             outgoing = any(h in (feed.ClassName or "").lower() for h in OUTGOING_HINTS) \
                 or any(h in (feed.AutomationId or "").lower() for h in OUTGOING_HINTS)
+            # Geometry fallback — Viber's UIA tree uses the same ClassName
+            # for both directions, so class/id hints almost always miss.
+            # If the bubble's horizontal center sits clearly in the right
+            # half of the chat pane, treat it as outgoing.
+            if not outgoing and pane_mid_x is not None and pane_width > 0:
+                try:
+                    br = feed.BoundingRectangle
+                    bubble_mid_x = (br.left + br.right) / 2.0
+                    # Require the bubble center to be at least 5% of the
+                    # pane width to the right of the midpoint. Avoids
+                    # classifying full-width bubbles (e.g. system notices)
+                    # or borderline cases as outgoing.
+                    if bubble_mid_x > pane_mid_x + 0.05 * pane_width:
+                        outgoing = True
+                        log.debug(
+                            "geom-outgoing: bubble_mid=%.0f pane_mid=%.0f width=%.0f",
+                            bubble_mid_x, pane_mid_x, pane_width,
+                        )
+                except Exception:
+                    pass
             sender = "me" if outgoing else name
             messages.append(ViberMessage(
                 conversation=name, sender=sender, text=text, outgoing=outgoing

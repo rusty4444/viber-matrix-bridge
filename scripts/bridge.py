@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from state import State, hash_msg
+from state import State, hash_msg, hash_content
 from matrix_client import MatrixClient
 from viber_client import ViberClient, ViberError
 
@@ -174,6 +174,17 @@ class Bridge:
                 continue
             for m in messages:
                 h = hash_msg(viber_name, m.sender, m.text)
+                ch = hash_content(viber_name, m.text)
+                # Content-based echo-suppression check FIRST: if we recently
+                # sent this exact text to this Viber chat from Matrix, the
+                # bubble we're now reading back IS that outbound message —
+                # regardless of how Viber's UIA tree classified its direction.
+                # Use consume() so the suppression is single-shot: if the
+                # peer legitimately replies with the same text, we only drop
+                # one occurrence (our echo), not all future matches.
+                if await self.state.consume(ch):
+                    await self.state.mark_seen(h, "viber->matrix")
+                    continue
                 if await self.state.seen(h):
                     continue
                 if m.outgoing:
@@ -194,9 +205,14 @@ class Bridge:
             log.debug("ignoring message in unmapped room %s", room_id)
             return
 
-        # Echo suppression: record that we're about to send this
+        # Echo suppression: record BOTH the sender-aware hash and the
+        # sender-independent content hash so the poll loop drops our own
+        # bubble when it shows up again in the chat, even if Viber's UIA
+        # tree doesn't expose a reliable outgoing-direction marker.
         h = hash_msg(viber_name, "me", body)
+        ch = hash_content(viber_name, body)
         await self.state.mark_seen(h, "matrix->viber")
+        await self.state.mark_seen(ch, "matrix->viber")
 
         # Hold the viber lock so we don't race with the poll loop or another
         # control-room command.

@@ -44,6 +44,24 @@ def hash_msg(viber_name: str, sender: str, text: str) -> str:
     return h.hexdigest()
 
 
+def hash_content(viber_name: str, text: str) -> str:
+    """Sender-independent hash.
+
+    Used for Matrix→Viber echo suppression: after we send a message *from*
+    Matrix into Viber, the poll loop will later see that same bubble in the
+    chat. We can't rely on detecting it as 'outgoing' (Viber's UIA tree
+    doesn't put a reliable direction marker on the node — both incoming and
+    outgoing FeedDelegates share the same ClassName), so we dedupe on content
+    alone within a short window.
+    """
+    h = hashlib.sha256()
+    h.update(b"content\x00")
+    h.update(viber_name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(text.strip().encode("utf-8"))
+    return h.hexdigest()
+
+
 class State:
     def __init__(self, path: str):
         self.path = path
@@ -117,3 +135,19 @@ class State:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("DELETE FROM seen_messages WHERE ts<?", (cutoff,))
             await db.commit()
+
+    async def consume(self, msg_hash: str) -> bool:
+        """Atomically test-and-delete a seen-messages row.
+
+        Returns True if the row existed (and was just removed). Used for
+        single-shot content-based echo suppression so that a legitimate
+        repeat from the peer with identical text isn't also swallowed.
+        """
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "DELETE FROM seen_messages WHERE hash=? RETURNING 1",
+                (msg_hash,),
+            )
+            row = await cur.fetchone()
+            await db.commit()
+            return row is not None
