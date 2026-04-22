@@ -270,7 +270,7 @@ Once a chat is paired:
 ## Limits & caveats (read these)
 
 - **Text only** in v1. No images, files, stickers, or reactions.
-- **No encryption.** Per-chat rooms are unencrypted (consistent with your other bridges).
+- **No encryption.** Per-chat rooms are unencrypted.
 - **Echo suppression** uses a content hash (sender-independent) plus a single-shot consume: when you send from Matrix, the bridge records the content hash; the next time that exact text appears in the paired Viber chat, it's dropped once. If the peer legitimately replies with the same text, only the first occurrence (your echo) is dropped — subsequent identical messages get through. Messages you type from Viber Desktop or your phone still forward into Matrix as normal.
 - **One Viber client per account.** Viber only allows one Desktop session; if you open Viber on another PC, this one logs out.
 - **Fragile.** Any Viber Desktop update can shift the UI tree and require selector tweaks.
