@@ -143,6 +143,27 @@ def _collect(parent, selector, results, recursive: bool, max_depth: int, depth: 
             _collect(c, selector, results, recursive=True, max_depth=max_depth, depth=depth + 1)
 
 
+def _visible_bounds(el) -> tuple[int, int, int, int] | None:
+    """Return (left, top, right, bottom) of el if it's actually rendered
+    on screen (non-zero area). None if virtualized / off-screen / no bounds.
+    """
+    try:
+        r = el.BoundingRectangle
+        if r is None:
+            return None
+        # uiautomation's Rect has .left .top .right .bottom
+        l, t, rt, b = r.left, r.top, r.right, r.bottom
+        if rt - l <= 0 or b - t <= 0:
+            return None
+        return (l, t, rt, b)
+    except Exception:
+        return None
+
+
+def _is_visible(el) -> bool:
+    return _visible_bounds(el) is not None
+
+
 def _read_text(el) -> str:
     """Extract text content from a UIA element.
 
@@ -362,14 +383,38 @@ class ViberClient:
         return [ViberConversation(name=f"row:{i}", unread=0)
                 for i in range(len(rows))]
 
+    def _focus_window(self):
+        """Bring the Viber window to the foreground so UIA can actually click.
+        Qt renders delegates lazily — off-screen / unfocused windows often
+        have zero-size bounding rects even for "present" controls.
+        """
+        try:
+            self.window.SetActive()
+        except Exception:
+            pass
+        try:
+            self.window.SetTopmost(True)
+            time.sleep(0.05)
+            self.window.SetTopmost(False)
+        except Exception:
+            pass
+        try:
+            self.window.SetFocus()
+        except Exception:
+            pass
+
     def open_conversation_by_search(self, name: str) -> bool:
         """Navigate to the chat with the given contact / group by typing the
-        name into Viber's top search box and clicking the first result.
+        name into Viber's top search box and clicking the first VISIBLE result.
 
-        This is the only reliable way to open a specific chat, because
-        conversation-row delegates expose no contact names via UIA.
+        Viber's QML virtualizes list delegates: non-visible rows exist in the
+        UIA tree but have zero-size bounding rectangles and cannot be clicked.
+        We must filter to only actually-rendered rows.
         """
         self._ensure_attached()
+        self._focus_window()
+        time.sleep(0.1)
+
         search = self._search_box()
         if search is None:
             log.error("Search box not found — check SEARCH_BOX selector")
@@ -377,29 +422,69 @@ class ViberClient:
         try:
             search.Click(simulateMove=False)
             time.sleep(0.15)
-            # Clear anything currently in the box
             auto.SendKeys("{Ctrl}a", waitTime=0.05)
             auto.SendKeys("{Delete}", waitTime=0.05)
             # Paste the query via clipboard (unicode-safe)
             pyperclip.copy(name)
             auto.SendKeys("{Ctrl}v", waitTime=0.1)
-            # Wait for the conversation list to re-filter
-            time.sleep(0.5)
-            # Click the first visible conversation row
+            # Give the list time to re-filter
+            time.sleep(0.7)
+
             app = self._app_content()
             if app is None:
+                log.error("ApplicationWindowContentControl not found after search")
                 return False
-            rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=4)
-            if not rows:
-                log.warning("No conversation rows visible after search for %r", name)
+
+            all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=4)
+            visible_rows = [r for r in all_rows if _is_visible(r)]
+            log.info("after search %r: %d delegate(s) total, %d visible",
+                     name, len(all_rows), len(visible_rows))
+
+            if not visible_rows:
+                # Log the bounds of every phantom delegate for debugging
+                for i, r in enumerate(all_rows):
+                    try:
+                        rect = r.BoundingRectangle
+                        log.debug("  row[%d] bounds=%s class=%r",
+                                  i, rect, r.ClassName)
+                    except Exception:
+                        pass
+                log.error("No VISIBLE conversation rows after search %r. "
+                          "Viber may be minimised, not focused, or the contact "
+                          "name didn't match anything.", name)
                 return False
-            first = rows[0]
-            first.Click(simulateMove=False)
-            time.sleep(self.cfg.get("click_pause_ms", 300) / 1000.0)
-            # Clear the search so the list returns to normal
-            search.Click(simulateMove=False)
-            auto.SendKeys("{Ctrl}a", waitTime=0.05)
-            auto.SendKeys("{Delete}", waitTime=0.05)
+
+            # Click the first visible row (top match)
+            target = visible_rows[0]
+            bounds = _visible_bounds(target)
+            log.info("clicking visible row at bounds=%s", bounds)
+            try:
+                target.Click(simulateMove=False)
+            except Exception as e:
+                log.error("Click on visible row failed: %s", e)
+                return False
+
+            # Give Viber time to swap in the chat
+            time.sleep(self.cfg.get("click_pause_ms", 400) / 1000.0)
+
+            # Verify a StackView (active chat pane) is now present
+            stack = self._chat_stack()
+            if stack is None:
+                log.error("StackView not found after click — chat didn't open")
+                return False
+
+            # Only NOW clear the search, once we know we're in the chat
+            try:
+                search.Click(simulateMove=False)
+                auto.SendKeys("{Ctrl}a", waitTime=0.05)
+                auto.SendKeys("{Delete}", waitTime=0.05)
+            except Exception:
+                pass
+            # Click back into the chat pane so next keystrokes go to input
+            try:
+                stack.Click(simulateMove=False)
+            except Exception:
+                pass
             return True
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)
@@ -548,6 +633,44 @@ def _dump_content(el, max_depth=15):
         print(f"{indent}- [{ctype}] class={cls!r} aid={aid[-60:]!r}{text_blurb}")
 
 
+def _inspect_search_main(query: str, max_depth: int = 10):
+    """Type a query into Viber's search box and dump the whole window tree,
+    flagging which controls are actually visible on screen. Used to find
+    where Viber renders search results.
+    """
+    c = ViberClient({"window_title": "Viber"})
+    c.attach()
+    c._focus_window()
+    time.sleep(0.2)
+    print(f"\n[1] Focusing Viber, typing {query!r} into search box...")
+    search = c._search_box()
+    if search is None:
+        print("    No search box found. Aborting.")
+        return
+    search.Click(simulateMove=False)
+    time.sleep(0.2)
+    auto.SendKeys("{Ctrl}a", waitTime=0.05)
+    auto.SendKeys("{Delete}", waitTime=0.05)
+    pyperclip.copy(query)
+    auto.SendKeys("{Ctrl}v", waitTime=0.1)
+    time.sleep(1.0)  # let results render
+    print(f"\n[2] Full window tree (max_depth={max_depth}) — 'VIS' marks controls with non-zero bounds:\n")
+    for depth, el in _walk(c.window, max_depth=max_depth):
+        indent = "  " * depth
+        vis = "VIS" if _is_visible(el) else "   "
+        try:
+            ctype = el.ControlTypeName
+            name = (el.Name or "")[:60]
+            cls = el.ClassName or ""
+            aid = (el.AutomationId or "")[-50:]
+            b = el.BoundingRectangle
+            bs = f"{b.left},{b.top},{b.right-b.left}x{b.bottom-b.top}" if b else "-"
+        except Exception:
+            continue
+        print(f"{indent}[{vis}] {ctype} name={name!r} class={cls!r} aid={aid!r} rect={bs}")
+    print("\n[3] Leaving Viber with search still populated so you can see it.")
+
+
 def _inspect_chat_main(contact_name: str, max_depth: int = 15):
     """Open a chat and dump everything about its contents."""
     c = ViberClient({"window_title": "Viber"})
@@ -577,6 +700,14 @@ if __name__ == "__main__":
             sys.exit(1)
         depth = int(argv[2]) if len(argv) > 2 else 15
         _inspect_chat_main(argv[1], max_depth=depth)
+        sys.exit(0)
+
+    if argv and argv[0] == "--inspect-search":
+        if len(argv) < 2:
+            print("usage: viber_client.py --inspect-search <query> [max_depth=10]")
+            sys.exit(1)
+        depth = int(argv[2]) if len(argv) > 2 else 10
+        _inspect_search_main(argv[1], max_depth=depth)
         sys.exit(0)
 
     c = ViberClient({"window_title": "Viber"})
