@@ -88,14 +88,36 @@ bash matrix-setup/accept-invite.sh '!abc123:samprim.net' 'syt_dmliZXI_xxx...'
 
 (You'll run this again for any future room you invite `@viber` into manually.)
 
-### 3. Install Viber Desktop on the Windows Media Server
+### 3. Create the working folder on Windows
+
+On the Windows Media Server:
+
+1. Create `C:\viber-bridge\`
+2. Copy **the contents of** `scripts/` into that folder (not the `scripts` folder itself) — so you end up with:
+
+   ```
+   C:\viber-bridge\
+   ├── bridge.py
+   ├── viber_client.py
+   ├── viber_selectors.py
+   ├── matrix_client.py
+   ├── state.py
+   ├── config.example.yaml
+   ├── requirements.txt
+   ├── install-service.bat
+   └── uninstall-service.bat
+   ```
+
+   The service installer batch files assume this exact layout (`C:\viber-bridge\`). If you put things elsewhere, edit the paths inside `install-service.bat`.
+
+### 4. Install Viber Desktop on the Windows Media Server
 
 - Download from [viber.com](https://www.viber.com/en/download/) and sign in with your phone number
 - Important: the bridge **must run in the same Windows user session** where Viber is signed in
 - Disable Viber's auto-update if possible (updates can break the UI tree)
 - Leave Viber running and pinned; the bridge needs the window to exist
 
-### 4. Install Python + dependencies on Windows
+### 5. Install Python + dependencies on Windows
 
 Assuming Python 3.11+ is installed:
 
@@ -106,7 +128,12 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 5. Configure
+> **Note:** we use `matrix-nio` *without* the `[e2e]` extra. That extra pulls
+> in `python-olm` which needs libolm + a C toolchain to build on Windows.
+> This bridge uses unencrypted rooms (consistent with the rest of the Matrix
+> setup), so no E2E dependency is needed.
+
+### 6. Configure
 
 ```powershell
 copy config.example.yaml config.yaml
@@ -115,7 +142,7 @@ notepad config.yaml
 
 Fill in: Matrix homeserver URL, access token, control room ID, Viber window title, polling intervals.
 
-### 6. Verify Viber UI selectors
+### 7. Verify Viber UI selectors
 
 Viber's UI tree changes between versions. Run the selector test tool:
 
@@ -125,7 +152,7 @@ python viber_client.py --inspect
 
 It will print the top-level control tree. Compare against `viber_selectors.py` and adjust names/automation IDs if needed. Microsoft's **Accessibility Insights for Windows** is very helpful here.
 
-### 7. First run (foreground, to watch logs)
+### 8. First run (foreground, to watch logs)
 
 ```powershell
 python bridge.py --config config.yaml
@@ -138,7 +165,7 @@ You should see:
 
 In the control room, try `!status` to confirm the bridge is responsive.
 
-### 8. Install as a Windows service
+### 9. Install as a Windows service
 
 Once stable, install with NSSM (download NSSM first and put `nssm.exe` in the folder):
 

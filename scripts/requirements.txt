@@ -1,4 +1,8 @@
-matrix-nio[e2e]==0.25.2
+# NOTE: we deliberately do NOT install matrix-nio[e2e]. End-to-end encryption
+# requires python-olm, which needs libolm + a C toolchain to build on Windows.
+# Bridge rooms are unencrypted (consistent with other mautrix bridges in this
+# setup), so we don't need it.
+matrix-nio==0.25.2
 aiohttp>=3.9.0
 aiosqlite>=0.19.0
 pyyaml>=6.0.1
