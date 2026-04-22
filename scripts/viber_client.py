@@ -591,16 +591,21 @@ class ViberClient:
             # Give the list time to re-filter
             time.sleep(0.7)
 
-            # Enumerate search-result delegates. Viber has shipped these
-            # under several QML-type suffixes across versions
-            # (ListViewDelegateLoader_QMLTYPE_465_QML_<NNNN>). Rather than
-            # hard-coding a suffix, enumerate ALL GroupControls whose
-            # AutomationId contains 'delegateLoader' and whose class name
-            # starts with the ListViewDelegateLoader prefix — that's the
-            # stable part. We filter to search-result geometry afterwards
-            # (sidebar width ~280–320 px, row height ~60–90 px).
-            all_rows = []
+            # Enumerate search-result delegates and CAPTURE bounds + name
+            # inline during enumeration. Rationale: ``uiautomation``'s
+            # foundIndex-based traversal returns fresh UIA proxies on each
+            # iteration, and the proxies collected earlier in the loop can
+            # report zero-area BoundingRectangle when re-queried later
+            # (Qt's IAccessible implementation sometimes detaches proxies
+            # after further tree activity). So we record every property we
+            # need into plain tuples right when we first see the row.
+            #
+            # Viber has shipped these rows under multiple QML-type suffixes
+            # across versions (ListViewDelegateLoader_QMLTYPE_465_QML_<NNNN>).
+            # We match the stable prefix and filter by sidebar geometry.
             ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
+            # Each entry: (ctrl, (l, t, r, b), class_name, name_text, aid)
+            captured: list[tuple] = []
             for i in range(1, 40):
                 try:
                     ctrl = auto.GroupControl(
@@ -620,27 +625,40 @@ class ViberClient:
                         # button at the top-left, a QQuickLoader that also
                         # carries AutomationId='delegateLoader').
                         continue
-                    b = ctrl.BoundingRectangle
+                    try:
+                        b = ctrl.BoundingRectangle
+                    except Exception:
+                        b = None
                     if b is None:
                         continue
-                    w = b.right - b.left
-                    h = b.bottom - b.top
-                    # Search-result rows live in the left sidebar
-                    # (~280–340 px wide) and are ~60–90 px tall. Reject
-                    # anything wildly outside to avoid grabbing container
-                    # delegates or unrelated widgets.
+                    bounds = (b.left, b.top, b.right, b.bottom)
+                    w = bounds[2] - bounds[0]
+                    h = bounds[3] - bounds[1]
+                    # Reject zero/negative area (virtualized / off-screen).
+                    if w <= 0 or h <= 0:
+                        continue
+                    # Sidebar search-result row geometry: width ~280–340 px,
+                    # height ~60–90 px. Be generous at the bounds.
                     if w < 200 or w > 400:
                         continue
                     if h < 40 or h > 200:
                         continue
-                    all_rows.append(ctrl)
+                    try:
+                        row_name = (ctrl.Name or "").strip()
+                    except Exception:
+                        row_name = ""
+                    try:
+                        row_aid = (ctrl.AutomationId or "").strip()
+                    except Exception:
+                        row_aid = ""
+                    captured.append((ctrl, bounds, cls, row_name, row_aid))
                 except Exception:
                     break
 
             # Secondary fallback: if the AID-based enumeration produced
             # nothing (e.g. Viber changed the AutomationId convention),
             # try the old exact-class selectors for both known suffixes.
-            if not all_rows:
+            if not captured:
                 for suffix in ("_QML_1615", "_QML_1643"):
                     for i in range(1, 15):
                         try:
@@ -652,97 +670,102 @@ class ViberClient:
                             )
                             if not ctrl.Exists(0.0, 0):
                                 break
-                            all_rows.append(ctrl)
+                            try:
+                                b = ctrl.BoundingRectangle
+                            except Exception:
+                                b = None
+                            if b is None:
+                                continue
+                            bounds = (b.left, b.top, b.right, b.bottom)
+                            if bounds[2] - bounds[0] <= 0 or bounds[3] - bounds[1] <= 0:
+                                continue
+                            try:
+                                row_name = (ctrl.Name or "").strip()
+                            except Exception:
+                                row_name = ""
+                            try:
+                                row_aid = (ctrl.AutomationId or "").strip()
+                            except Exception:
+                                row_aid = ""
+                            captured.append((ctrl, bounds, f"{ROW_CLASS_PREFIX}{suffix}",
+                                             row_name, row_aid))
                         except Exception:
                             break
-                    if all_rows:
+                    if captured:
                         break
 
-            visible_rows = [r for r in all_rows if _is_visible(r)]
-            visible_rows = _dedup_by_position(visible_rows)
-            visible_rows.sort(key=lambda r: r.BoundingRectangle.top)
-            log.info("after search %r: %d delegate(s) total, %d unique visible",
-                     name, len(all_rows), len(visible_rows))
+            # Dedup by (left, top) — Qt's UIA bug sometimes returns the same
+            # element many times via different tree paths.
+            seen_pos = set()
+            unique: list[tuple] = []
+            for tup in captured:
+                key = (tup[1][0], tup[1][1])
+                if key in seen_pos:
+                    continue
+                seen_pos.add(key)
+                unique.append(tup)
+            # Sort by cached top coordinate (don't re-query BoundingRectangle).
+            unique.sort(key=lambda t: t[1][1])
 
-            if not visible_rows:
-                log.error("No VISIBLE conversation rows after search %r. "
+            log.info("after search %r: %d delegate(s) captured, %d unique",
+                     name, len(captured), len(unique))
+
+            if not unique:
+                log.error("No search-result rows matched after search %r. "
                           "Viber may be minimised, not focused, or the contact "
-                          "name didn't match anything.", name)
+                          "name didn't match anything. Tried AID=delegateLoader "
+                          "with class prefix %r and geometry 200–400px x 40–200px.",
+                          name, ROW_CLASS_PREFIX)
                 return False
 
-            # Log every visible row's name/class/geometry. Viber groups
-            # search results into sections: Conversations (top), Contacts,
-            # Channels. We want the row under 'Conversations' whose Name
-            # matches the query — that's the already-paired chat history.
-            # Clicking any other section row either opens a new
-            # contact/channel view or a section header (no chat).
-            def _row_name(c):
-                try:
-                    return (c.Name or "").strip()
-                except Exception:
-                    return ""
-            def _row_aid(c):
-                try:
-                    return (c.AutomationId or "").strip()
-                except Exception:
-                    return ""
-            def _row_height(c):
-                b = c.BoundingRectangle
-                return b.bottom - b.top
-            def _row_top(c):
-                return c.BoundingRectangle.top
+            # Log every captured row's cached properties for diagnostics.
+            # Viber groups search results into sections (Conversations,
+            # Contacts, Channels); we prefer the Conversations row whose
+            # Name matches the query.
+            for idx, (ctrl, bnds, cls, row_name, row_aid) in enumerate(unique):
+                log.info("  row[%d] name=%r aid=%r bounds=(%d,%d,%d,%d) h=%d cls=%r",
+                         idx, row_name[:40], row_aid[:30],
+                         bnds[0], bnds[1], bnds[2], bnds[3], bnds[3] - bnds[1],
+                         cls[:50])
 
-            for i, rr in enumerate(visible_rows):
-                try:
-                    br = rr.BoundingRectangle
-                    log.info("  row[%d] name=%r aid=%r bounds=(%d,%d,%d,%d) h=%d",
-                             i, _row_name(rr)[:40], _row_aid(rr)[:30],
-                             br.left, br.top, br.right, br.bottom,
-                             br.bottom - br.top)
-                except Exception:
-                    pass
-
-            # Pick strategy, best-first:
-            #   1. Row whose Name exactly case-insensitively equals the query
-            #      AND has a sane height (40–200px).
-            #   2. Row whose Name starts with the query (same sane height).
-            #   3. Row whose Name contains the query (same sane height).
-            #   4. Topmost sane-height row (current behaviour).
-            #   5. Shortest row (avoids the full-viewport container delegate).
+            # Pick strategy, best-first (all operate on cached row_name):
+            #   1. Exact case-insensitive Name match
+            #   2. Name prefix match
+            #   3. Name substring match
+            #   4. All query-words present (any order) — handles multi-word
+            #      contacts where Viber adds a suffix to the display name
+            #   5. Topmost row (no name match)
             query_lc = name.strip().lower()
-            def sane(r):
-                h = _row_height(r)
-                return 40 <= h <= 200
-            sane_rows = [r for r in visible_rows if sane(r)]
-            target = None
+            query_words = [w for w in query_lc.split() if w]
+            target_tup = None
             pick_reason = ""
             for pred, label in [
-                (lambda r: _row_name(r).lower() == query_lc, "exact-name match"),
-                (lambda r: _row_name(r).lower().startswith(query_lc), "name-prefix match"),
-                (lambda r: query_lc in _row_name(r).lower(), "name-substring match"),
+                (lambda n: n.lower() == query_lc, "exact-name match"),
+                (lambda n: n.lower().startswith(query_lc), "name-prefix match"),
+                (lambda n: query_lc in n.lower(), "name-substring match"),
+                (lambda n: all(w in n.lower() for w in query_words) if query_words else False,
+                 "all-words-present match"),
             ]:
-                matches = [r for r in sane_rows if pred(r)]
+                matches = [t for t in unique if pred(t[3])]
                 if matches:
-                    matches.sort(key=_row_top)
-                    target = matches[0]
+                    matches.sort(key=lambda t: t[1][1])
+                    target_tup = matches[0]
                     pick_reason = label
                     break
-            if target is None:
-                if sane_rows:
-                    sane_rows.sort(key=_row_top)
-                    target = sane_rows[0]
-                    pick_reason = "topmost sane-height row (no name match)"
-                else:
-                    log.warning("no row with sane height 40–200px after search %r; "
-                                "falling back to shortest of %d visible rows",
-                                name, len(visible_rows))
-                    target = min(visible_rows, key=_row_height)
-                    pick_reason = "shortest fallback row"
+            if target_tup is None:
+                target_tup = unique[0]  # already sorted by top
+                pick_reason = "topmost row (no name match)"
 
-            r = target.BoundingRectangle
-            # Click near the top-left of the picked row (avatar/name area).
-            click_x = r.left + 50
-            click_y = r.top + min(30, max(10, (r.bottom - r.top) // 3))
+            # Use the CACHED bounds for click coordinates, not a re-query.
+            target, bnds, _cls, _nm, _aid = target_tup
+            cl_left, cl_top, cl_right, cl_bottom = bnds
+            click_x = cl_left + 50
+            click_y = cl_top + min(30, max(10, (cl_bottom - cl_top) // 3))
+            r = type("_R", (), {"left": cl_left, "top": cl_top,
+                                "right": cl_right, "bottom": cl_bottom})()
+            # Alias for the diagnostic log line below.
+            def _row_name(c):
+                return _nm
             log.info("clicking search result at screen (%d,%d) [picked=%r "
                      "reason=%s bounds=(%d,%d,%d,%d) h=%d]",
                      click_x, click_y, _row_name(target)[:40], pick_reason,
