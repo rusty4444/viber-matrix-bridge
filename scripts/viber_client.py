@@ -542,23 +542,48 @@ class ViberClient:
             # Give the list time to re-filter
             time.sleep(0.7)
 
-            # Enumerate search-result delegates via native FindFirst foundIndex
-            # loop. This avoids GetChildren() recursion which corrupts Qt's
-            # accessibility tree (see #15).
+            # Enumerate search-result delegates. Search results use class
+            # name ListViewDelegateLoader_QMLTYPE_465_QML_1643 (distinct
+            # from the normal chat list's _1615 variant). Use the exact
+            # class and a shallow search depth to minimise UIA activity
+            # — each extra FindFirst call risks degrading Qt's tree.
             all_rows = []
-            for i in range(1, 30):
+            for i in range(1, 10):
                 try:
                     ctrl = auto.GroupControl(
                         searchFromControl=self.window,
-                        AutomationId="delegateLoader",
+                        ClassName="ListViewDelegateLoader_QMLTYPE_465_QML_1643",
                         foundIndex=i,
-                        searchDepth=20,
+                        searchDepth=3,
                     )
                     if not ctrl.Exists(0.0, 0):
                         break
                     all_rows.append(ctrl)
                 except Exception:
                     break
+
+            # Fallback: if exact class didn't match (Viber updated the
+            # QML type number), fall back to the broader automationId
+            # lookup with still-shallow depth.
+            if not all_rows:
+                for i in range(1, 15):
+                    try:
+                        ctrl = auto.GroupControl(
+                            searchFromControl=self.window,
+                            AutomationId="delegateLoader",
+                            foundIndex=i,
+                            searchDepth=4,
+                        )
+                        if not ctrl.Exists(0.0, 0):
+                            break
+                        # Skip non-row delegates (the small QQuickLoader
+                        # buttons at the top also have automationId=delegateLoader)
+                        b = ctrl.BoundingRectangle
+                        if b is None or b.right - b.left < 200:
+                            continue
+                        all_rows.append(ctrl)
+                    except Exception:
+                        break
 
             visible_rows = [r for r in all_rows if _is_visible(r)]
             visible_rows = _dedup_by_position(visible_rows)
@@ -592,46 +617,74 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Let the click register, then dismiss search mode with plain
-            # keyboard input only — avoid UIA clicks here because they can
-            # further perturb Qt's accessibility state.
-            time.sleep(0.4)
+            # Click registered — chat is now open on the right, but Viber
+            # is in hybrid "search+chat" mode where the StackView is NOT
+            # exposed to UIA. To get the StackView into the tree, we need
+            # to put Viber in true "normal chat mode" by clicking the chat
+            # from the normal conversation list (not search results).
+            time.sleep(0.5)
+
+            # Clear search with keyboard only (no UIA clicks to preserve tree)
             try:
                 auto.SendKeys("{Esc}", waitTime=0.15)
-                # Ctrl+A + Delete in the currently-focused control (still the
-                # search box usually) to clear any residual text.
                 auto.SendKeys("{Ctrl}a", waitTime=0.05)
                 auto.SendKeys("{Delete}", waitTime=0.1)
                 auto.SendKeys("{Esc}", waitTime=0.15)
             except Exception as e:
                 log.debug("clearing search: %s", e)
 
-            # Wait for Viber to exit search mode and settle its UIA tree.
-            # This sleep is important — without it, FindFirst will hit the
-            # transient tree that doesn't yet include the chat pane.
+            # Wait for the normal conversation list to redraw.
+            time.sleep(1.0)
+
+            # Find the topmost visible _1615 (normal list) delegate — since
+            # we just opened this chat, it will have bubbled to the top of
+            # the conversation list. Clicking it re-opens the same chat in
+            # "normal chat mode" which DOES populate the StackView.
+            try:
+                normal_rows = []
+                for i in range(1, 8):
+                    ctrl = auto.GroupControl(
+                        searchFromControl=self.window,
+                        ClassName="ListViewDelegateLoader_QMLTYPE_465_QML_1615",
+                        foundIndex=i,
+                        searchDepth=3,
+                    )
+                    if not ctrl.Exists(0.0, 0):
+                        break
+                    normal_rows.append(ctrl)
+                normal_rows = [r for r in normal_rows if _is_visible(r)]
+                normal_rows = _dedup_by_position(normal_rows)
+                normal_rows.sort(key=lambda r: r.BoundingRectangle.top)
+                if normal_rows:
+                    top = normal_rows[0]
+                    rr = top.BoundingRectangle
+                    auto.Click(rr.left + 50, rr.top + 30, waitTime=0.1)
+                    log.info("re-clicked topmost normal-list row at (%d,%d) "
+                             "to enter normal chat mode",
+                             rr.left + 50, rr.top + 30)
+                else:
+                    log.warning("no normal-list rows visible; cannot re-click")
+            except Exception as e:
+                log.debug("normal-list re-click failed: %s", e)
+
+            # Give Viber time to enter normal mode and expose the StackView.
             time.sleep(1.5)
 
-            # Single FindFirst for the chat pane (StackView or FeedDelegate).
-            # NO polling loop, NO multiple simultaneous searches — each extra
-            # UIA call risks degrading Qt's tree.
+            # Single FindFirst for the chat pane.
             stack = _native_find(self.window, "PaneControl",
                                   STACKVIEW_EXACT_CLASS,
                                   timeout=2.0, search_depth=20)
-            if stack is None:
-                # Only if StackView missing, try one fallback: a FeedDelegate.
-                feed = _native_find(self.window, "GroupControl",
-                                     MESSAGE_ITEM_EXACT_CLASS,
-                                     timeout=1.0, search_depth=20)
-                if feed is None:
-                    log.error(
-                        "Chat verification failed after search-clear. "
-                        "StackView and FeedDelegate both absent from UIA tree."
-                    )
-                    return False
-                log.info("chat opened (verified via FeedDelegate)")
-            else:
-                log.info("chat opened (verified via StackView)")
-            return True
+            if stack is not None:
+                log.info("chat opened (StackView found after normal-list re-click)")
+                return True
+            feed = _native_find(self.window, "GroupControl",
+                                 MESSAGE_ITEM_EXACT_CLASS,
+                                 timeout=1.0, search_depth=20)
+            if feed is not None:
+                log.info("chat opened (FeedDelegate found, no StackView)")
+                return True
+            log.error("Chat verification failed even after normal-list re-click.")
+            return False
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)
             return False
