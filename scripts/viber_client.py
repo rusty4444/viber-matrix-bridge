@@ -839,23 +839,88 @@ def _inspect_search_main(query: str, max_depth: int = 10):
     print("\n[3] Leaving Viber with search still populated so you can see it.")
 
 
-def _inspect_chat_main(contact_name: str, max_depth: int = 15):
-    """Open a chat and dump everything about its contents."""
+def _inspect_chat_main(contact_name: str, max_depth: int = 8):
+    """Step through the open-chat sequence manually, dumping the UIA tree
+    at key moments to diagnose what's visible and what isn't."""
     c = ViberClient({"window_title": "Viber"})
     c.attach()
-    print(f"\n[1] Searching for and opening chat {contact_name!r}...")
-    ok = c.open_conversation_by_search(contact_name)
-    if not ok:
-        print("    FAILED to open chat. Aborting.")
+    c._focus_window()
+    time.sleep(0.2)
+
+    # --- Step 1: type into search ---
+    print(f"\n[1] Typing {contact_name!r} into search box...")
+    search = c._search_box()
+    if search is None:
+        print("    No search box found.")
         return
-    print("    Opened.")
-    time.sleep(1.0)   # let Viber render
-    stack = c._chat_stack()
-    if stack is None:
-        print("    Could not find StackView after opening chat.")
+    search.Click(simulateMove=False)
+    time.sleep(0.2)
+    auto.SendKeys("{Ctrl}a", waitTime=0.05)
+    auto.SendKeys("{Delete}", waitTime=0.05)
+    pyperclip.copy(contact_name)
+    auto.SendKeys("{Ctrl}v", waitTime=0.1)
+    time.sleep(1.0)
+
+    # --- Step 2: click the topmost visible row ---
+    print("\n[2] Clicking first visible search result...")
+    app = c._app_content()
+    all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=12)
+    visible = _dedup_by_position([r for r in all_rows if _is_visible(r)])
+    visible.sort(key=lambda r: r.BoundingRectangle.top)
+    if not visible:
+        print("    No visible rows found.")
         return
-    print(f"\n[2] StackView subtree (max_depth={max_depth}) with pattern-value dumps:\n")
-    _dump_content(stack, max_depth=max_depth)
+    r0 = visible[0]
+    cx, cy = r0.BoundingRectangle.left + 50, r0.BoundingRectangle.top + 30
+    print(f"    Clicking ({cx},{cy}) — first of {len(visible)} visible rows")
+    auto.Click(cx, cy, waitTime=0.1)
+    time.sleep(0.5)
+
+    # --- Step 3: clear search ---
+    print("\n[3] Clearing search (Escape + explicit clear)...")
+    auto.SendKeys("{Esc}", waitTime=0.2)
+    try:
+        search.Click(simulateMove=False)
+        auto.SendKeys("{Ctrl}a", waitTime=0.05)
+        auto.SendKeys("{Delete}", waitTime=0.1)
+        auto.SendKeys("{Esc}", waitTime=0.1)
+    except Exception as e:
+        print(f"    (clear error: {e})")
+    time.sleep(1.0)
+
+    # --- Step 4: dump tree with VIS markers ---
+    print(f"\n[4] Window tree AFTER clear (max_depth={max_depth}) — VIS = non-zero bounds:")
+    for depth, el in _walk(c.window, max_depth=max_depth):
+        indent = "  " * depth
+        vis = "VIS" if _is_visible(el) else "   "
+        try:
+            ctype = el.ControlTypeName
+            cls   = (el.ClassName or "")
+            aid   = (el.AutomationId or "")[-50:]
+            b     = el.BoundingRectangle
+            bs    = f"{b.left},{b.top},{b.right-b.left}x{b.bottom-b.top}" if b else "-"
+        except Exception:
+            continue
+        print(f"{indent}[{vis}] {ctype:20s} class={cls!r:50s} rect={bs}")
+
+    # --- Step 5: try all three find strategies ---
+    print("\n[5] Trying each find strategy:")
+    print(f"    _native_find StackView     : {_native_find(c.window, 'PaneControl', STACKVIEW_EXACT_CLASS, timeout=2.0)}")
+    print(f"    _native_find QQuickTextEdit: {_native_find(c.window, 'EditControl',  INPUT_BOX_EXACT_CLASS,  timeout=2.0)}")
+    print(f"    _native_find FeedDelegate  : {_native_find(c.window, 'GroupControl', MESSAGE_ITEM_EXACT_CLASS,timeout=2.0)}")
+    native_all = _native_find_all(c.window, "GroupControl", r"FeedDelegate_QMLTYPE_\d+", search_depth=20)
+    print(f"    _native_find_all FeedDel   : {len(native_all)} results")
+    our_find = _find(c.window, CHAT_STACK, timeout=2.0)
+    print(f"    _find (GetChildren) StackView: {our_find}")
+
+    # --- Step 6: if StackView found, dump its content ---
+    stack = _native_find(c.window, "PaneControl", STACKVIEW_EXACT_CLASS, timeout=1.0) \
+            or _find(c.window, CHAT_STACK, timeout=1.0)
+    if stack:
+        print(f"\n[6] StackView found! Dumping content with pattern values:")
+        _dump_content(stack, max_depth=6)
+    else:
+        print("\n[6] StackView not found by any method. Content dump skipped.")
 
 
 if __name__ == "__main__":
