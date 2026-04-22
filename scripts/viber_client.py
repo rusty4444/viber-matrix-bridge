@@ -591,47 +591,71 @@ class ViberClient:
             # Give the list time to re-filter
             time.sleep(0.7)
 
-            # Enumerate search-result delegates. Search results use class
-            # name ListViewDelegateLoader_QMLTYPE_465_QML_1643 (distinct
-            # from the normal chat list's _1615 variant). Use the exact
-            # class and a shallow search depth to minimise UIA activity
-            # — each extra FindFirst call risks degrading Qt's tree.
+            # Enumerate search-result delegates. Viber has shipped these
+            # under several QML-type suffixes across versions
+            # (ListViewDelegateLoader_QMLTYPE_465_QML_<NNNN>). Rather than
+            # hard-coding a suffix, enumerate ALL GroupControls whose
+            # AutomationId contains 'delegateLoader' and whose class name
+            # starts with the ListViewDelegateLoader prefix — that's the
+            # stable part. We filter to search-result geometry afterwards
+            # (sidebar width ~280–320 px, row height ~60–90 px).
             all_rows = []
-            for i in range(1, 10):
+            ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
+            for i in range(1, 40):
                 try:
                     ctrl = auto.GroupControl(
                         searchFromControl=self.window,
-                        ClassName="ListViewDelegateLoader_QMLTYPE_465_QML_1643",
+                        AutomationId="delegateLoader",
                         foundIndex=i,
-                        searchDepth=3,
+                        searchDepth=4,
                     )
                     if not ctrl.Exists(0.0, 0):
                         break
+                    try:
+                        cls = ctrl.ClassName or ""
+                    except Exception:
+                        cls = ""
+                    if not cls.startswith(ROW_CLASS_PREFIX):
+                        # Skip small unrelated delegates (e.g. the profile
+                        # button at the top-left, a QQuickLoader that also
+                        # carries AutomationId='delegateLoader').
+                        continue
+                    b = ctrl.BoundingRectangle
+                    if b is None:
+                        continue
+                    w = b.right - b.left
+                    h = b.bottom - b.top
+                    # Search-result rows live in the left sidebar
+                    # (~280–340 px wide) and are ~60–90 px tall. Reject
+                    # anything wildly outside to avoid grabbing container
+                    # delegates or unrelated widgets.
+                    if w < 200 or w > 400:
+                        continue
+                    if h < 40 or h > 200:
+                        continue
                     all_rows.append(ctrl)
                 except Exception:
                     break
 
-            # Fallback: if exact class didn't match (Viber updated the
-            # QML type number), fall back to the broader automationId
-            # lookup with still-shallow depth.
+            # Secondary fallback: if the AID-based enumeration produced
+            # nothing (e.g. Viber changed the AutomationId convention),
+            # try the old exact-class selectors for both known suffixes.
             if not all_rows:
-                for i in range(1, 15):
-                    try:
-                        ctrl = auto.GroupControl(
-                            searchFromControl=self.window,
-                            AutomationId="delegateLoader",
-                            foundIndex=i,
-                            searchDepth=4,
-                        )
-                        if not ctrl.Exists(0.0, 0):
+                for suffix in ("_QML_1615", "_QML_1643"):
+                    for i in range(1, 15):
+                        try:
+                            ctrl = auto.GroupControl(
+                                searchFromControl=self.window,
+                                ClassName=f"{ROW_CLASS_PREFIX}{suffix}",
+                                foundIndex=i,
+                                searchDepth=3,
+                            )
+                            if not ctrl.Exists(0.0, 0):
+                                break
+                            all_rows.append(ctrl)
+                        except Exception:
                             break
-                        # Skip non-row delegates (the small QQuickLoader
-                        # buttons at the top also have automationId=delegateLoader)
-                        b = ctrl.BoundingRectangle
-                        if b is None or b.right - b.left < 200:
-                            continue
-                        all_rows.append(ctrl)
-                    except Exception:
+                    if all_rows:
                         break
 
             visible_rows = [r for r in all_rows if _is_visible(r)]
