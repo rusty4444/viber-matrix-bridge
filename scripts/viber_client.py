@@ -501,12 +501,87 @@ class ViberClient:
 
 
 # CLI inspection helper ----------------------------------------------------
+def _dump_content(el, max_depth=15):
+    """Dump a subtree, and for every leaf-ish control try to read its text
+    via every available UIA pattern. Used by --inspect-chat to locate where
+    Viber stores message text.
+    """
+    for depth, c in _walk(el, max_depth=max_depth):
+        indent = "  " * depth
+        try:
+            ctype = c.ControlTypeName
+            name = (c.Name or "").replace("\n", " \\n ")
+            cls = c.ClassName or ""
+            aid = c.AutomationId or ""
+        except Exception as e:
+            print(f"{indent}<err {e}>")
+            continue
+
+        # Gather text via all patterns
+        texts = []
+        if name:
+            texts.append(f"Name={name[:120]!r}")
+        try:
+            vp = c.GetValuePattern()
+            if vp and vp.Value:
+                texts.append(f"Value={vp.Value[:120]!r}")
+        except Exception:
+            pass
+        try:
+            tp = c.GetTextPattern()
+            if tp:
+                t = tp.DocumentRange.GetText(200)
+                if t and t.strip():
+                    texts.append(f"Text={t.strip()[:120]!r}")
+        except Exception:
+            pass
+        try:
+            lp = c.GetLegacyIAccessiblePattern()
+            if lp:
+                lv = lp.Value
+                if lv and lv.strip():
+                    texts.append(f"LegacyValue={lv.strip()[:120]!r}")
+        except Exception:
+            pass
+
+        text_blurb = (" | " + " ".join(texts)) if texts else ""
+        print(f"{indent}- [{ctype}] class={cls!r} aid={aid[-60:]!r}{text_blurb}")
+
+
+def _inspect_chat_main(contact_name: str, max_depth: int = 15):
+    """Open a chat and dump everything about its contents."""
+    c = ViberClient({"window_title": "Viber"})
+    c.attach()
+    print(f"\n[1] Searching for and opening chat {contact_name!r}...")
+    ok = c.open_conversation_by_search(contact_name)
+    if not ok:
+        print("    FAILED to open chat. Aborting.")
+        return
+    print("    Opened.")
+    time.sleep(1.0)   # let Viber render
+    stack = c._chat_stack()
+    if stack is None:
+        print("    Could not find StackView after opening chat.")
+        return
+    print(f"\n[2] StackView subtree (max_depth={max_depth}) with pattern-value dumps:\n")
+    _dump_content(stack, max_depth=max_depth)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--inspect-chat":
+        if len(argv) < 2:
+            print("usage: viber_client.py --inspect-chat <contact-name> [max_depth=15]")
+            sys.exit(1)
+        depth = int(argv[2]) if len(argv) > 2 else 15
+        _inspect_chat_main(argv[1], max_depth=depth)
+        sys.exit(0)
+
     c = ViberClient({"window_title": "Viber"})
     c.attach()
 
-    argv = sys.argv[1:]
     if argv and argv[0] == "--inspect-subtree":
         if len(argv) < 2:
             print("usage: viber_client.py --inspect-subtree <classname-or-automationid-substring>")
@@ -520,8 +595,9 @@ if __name__ == "__main__":
         print("Usage:")
         print("  python viber_client.py --inspect [max_depth=8]")
         print("  python viber_client.py --inspect-subtree <needle> [max_depth=10]")
+        print("  python viber_client.py --inspect-chat <contact-name> [max_depth=15]")
         print()
         print("Examples:")
         print("  python viber_client.py --inspect 10")
-        print("  python viber_client.py --inspect-subtree SideBarContent")
         print("  python viber_client.py --inspect-subtree StackView")
+        print("  python viber_client.py --inspect-chat Candy")
