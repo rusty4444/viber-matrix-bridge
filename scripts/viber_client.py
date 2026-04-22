@@ -960,14 +960,23 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Chat is visually open on the right, but Viber is in hybrid
-            # 'search+chat' mode: the StackView and FeedDelegate are NOT in
-            # the UIA tree even though they're rendered on screen. Qt's
-            # accessibility bridge only exposes them once Viber leaves
-            # search mode.
+            # Chat is visually open on the right, but Viber is now in
+            # hybrid 'search+chat' mode: the StackView and FeedDelegate
+            # are NOT exposed to UIA even though they're rendered. Qt's
+            # accessibility bridge only populates them in 'normal chat
+            # mode' — i.e. a chat opened from the normal conversation
+            # list, not from search results.
             #
-            # Exit hybrid mode by clearing the search box (Esc + clear).
-            time.sleep(0.4)
+            # Two-step navigation (restored from 6e0cf41, removed by
+            # mistake in 99bbb78):
+            #   1. Clear search with keyboard only (no UIA clicks to
+            #      preserve the tree).
+            #   2. Re-click the topmost visible delegate in the normal
+            #      conversation list. Since we just opened this chat,
+            #      it will have bubbled to the top of the recency-sorted
+            #      list. Clicking it re-opens the same chat in 'normal
+            #      chat mode' which DOES expose the StackView.
+            time.sleep(0.5)
             try:
                 auto.SendKeys("{Esc}", waitTime=0.15)
                 auto.SendKeys("{Ctrl}a", waitTime=0.05)
@@ -975,15 +984,73 @@ class ViberClient:
                 auto.SendKeys("{Esc}", waitTime=0.15)
             except Exception as e:
                 log.debug("clearing search: %s", e)
-            time.sleep(0.5)
 
-            # Try to verify by finding the StackView or FeedDelegate. Some
-            # Viber builds expose them, some don't — we can't rely on it.
-            # Retry a few times with escalating nudges:
-            #   attempt 1: just wait
-            #   attempt 2: click the right-pane area to focus it
-            #   attempt 3: re-click the originally-picked row to force
-            #              Viber to commit the selection
+            # Wait for the normal conversation list to redraw.
+            time.sleep(1.0)
+
+            # Enumerate normal-list delegates. Viber has shipped these
+            # under multiple QML-type suffixes (_QML_1615, _QML_1643, and
+            # possibly others on future builds) so we match the stable
+            # prefix and filter by sidebar geometry — same pattern as the
+            # first-click enumeration above.
+            ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
+            normal_captured: list[tuple] = []
+            for i in range(1, 15):
+                try:
+                    ctrl = auto.GroupControl(
+                        searchFromControl=self.window,
+                        AutomationId="delegateLoader",
+                        foundIndex=i,
+                        searchDepth=4,
+                    )
+                    if not ctrl.Exists(0.0, 0):
+                        break
+                    try:
+                        ncls = ctrl.ClassName or ""
+                    except Exception:
+                        ncls = ""
+                    if not ncls.startswith(ROW_CLASS_PREFIX):
+                        continue
+                    nb = _read_bounds_live(ctrl)
+                    if nb is None:
+                        continue
+                    nw = nb[2] - nb[0]; nh = nb[3] - nb[1]
+                    if nw < 200 or nw > 400 or nh < 40 or nh > 200:
+                        continue
+                    normal_captured.append((ctrl, nb, ncls))
+                except Exception:
+                    break
+            # Dedup by (left, top) and sort by top.
+            nseen = set(); normal_unique: list[tuple] = []
+            for tup in normal_captured:
+                key = (tup[1][0], tup[1][1])
+                if key in nseen:
+                    continue
+                nseen.add(key)
+                normal_unique.append(tup)
+            normal_unique.sort(key=lambda t: t[1][1])
+
+            if normal_unique:
+                _nctrl, nb, ncls = normal_unique[0]
+                ncx = nb[0] + 50
+                ncy = nb[1] + min(30, max(10, (nb[3] - nb[1]) // 3))
+                log.info("re-clicking topmost normal-list row at (%d,%d) "
+                         "[bounds=(%d,%d,%d,%d) cls=%r] to enter normal chat mode",
+                         ncx, ncy, nb[0], nb[1], nb[2], nb[3], ncls[:50])
+                try:
+                    auto.Click(ncx, ncy, waitTime=0.1)
+                except Exception as e:
+                    log.debug("normal-list re-click failed: %s", e)
+            else:
+                log.warning("no normal-list rows visible after clearing search; "
+                            "cannot re-click to enter normal mode")
+
+            # Give Viber time to transition and expose the StackView.
+            time.sleep(1.5)
+
+            # Verify via native FindFirst for StackView / FeedDelegate /
+            # input box. Any of the three is a strong signal the right
+            # pane is actually in the UIA tree now.
             def _verify_now() -> bool:
                 stack = _native_find(self.window, "PaneControl",
                                      STACKVIEW_EXACT_CLASS,
@@ -997,52 +1064,32 @@ class ViberClient:
                 if feed is not None:
                     log.info("chat opened (FeedDelegate found)")
                     return True
+                inp = _native_find(self.window, "EditControl",
+                                   INPUT_BOX_EXACT_CLASS,
+                                   timeout=0.5, search_depth=20)
+                if inp is not None:
+                    log.info("chat opened (input box found)")
+                    return True
                 return False
 
-            def _right_pane_click():
-                try:
-                    wb = self.window.BoundingRectangle
-                    if wb is not None and (wb.right - wb.left) > 0:
-                        cx = wb.left + int((wb.right - wb.left) * 0.65)
-                        cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
-                        log.info("clicking right-pane area at (%d,%d) to exit hybrid mode",
-                                 cx, cy)
-                        auto.Click(cx, cy, waitTime=0.1)
-                except Exception as e:
-                    log.debug("right-pane click: %s", e)
-
-            # attempt 1: just wait
-            time.sleep(1.0)
-            if _verify_now():
-                return True
-            # attempt 2: right-pane click
-            _right_pane_click()
-            time.sleep(1.2)
-            if _verify_now():
-                return True
-            # attempt 3: re-click the original row
-            try:
-                log.info("re-clicking original row at (%d,%d)", click_x, click_y)
-                auto.Click(click_x, click_y, waitTime=0.1)
-            except Exception:
-                pass
-            time.sleep(1.2)
             if _verify_now():
                 return True
 
-            # Neither StackView nor FeedDelegate is exposed via UIA. But we
-            # clicked a REAL search-result row with real bounds, and on
-            # this Viber build Qt doesn't always expose the right pane to
-            # the accessibility tree even when the chat is visibly open.
-            # Trust the click: downstream send_message / read_open_chat
-            # have their own native-find retries and will give a more
-            # specific error if the chat really isn't open.
+            # Second chance: wait a bit longer and try again. Qt can be
+            # slow on heavy chats (lots of history / attachments).
+            time.sleep(1.5)
+            if _verify_now():
+                return True
+
+            # Last resort: if we DID successfully click a row with real
+            # bounds, the chat is probably open visually even if Qt isn't
+            # exposing the pane. Trust the click and let downstream
+            # send/read surface specific errors.
             log.warning(
-                "Chat verification could not locate StackView or FeedDelegate "
-                "after clicking a real row with bounds %r. Qt may not be "
-                "exposing the right pane on this Viber build; trusting the "
-                "click and returning success. Downstream send/read will "
-                "surface a specific error if the chat didn't actually open.",
+                "Chat verification could not locate StackView, FeedDelegate "
+                "or input box after two-step navigation. Clicked row bounds=%r. "
+                "Trusting the click; downstream send/read will give a more "
+                "specific error if the chat didn't actually open.",
                 bnds,
             )
             return True
