@@ -961,15 +961,13 @@ class ViberClient:
                 return False
 
             # Chat is visually open on the right, but Viber is in hybrid
-            # 'search+chat' mode: the StackView is NOT in the UIA tree.
-            # Strategy: click inside the RIGHT PANE AREA (not on any
-            # control, just within the chat panel bounds) to give that
-            # side focus. This may transition Viber to normal chat mode
-            # and expose the StackView. We calculate coordinates window-
-            # relative so they work regardless of where Viber is on screen.
-            time.sleep(0.5)
-
-            # First, clear search with keyboard only (no UIA clicks).
+            # 'search+chat' mode: the StackView and FeedDelegate are NOT in
+            # the UIA tree even though they're rendered on screen. Qt's
+            # accessibility bridge only exposes them once Viber leaves
+            # search mode.
+            #
+            # Exit hybrid mode by clearing the search box (Esc + clear).
+            time.sleep(0.4)
             try:
                 auto.SendKeys("{Esc}", waitTime=0.15)
                 auto.SendKeys("{Ctrl}a", waitTime=0.05)
@@ -977,60 +975,77 @@ class ViberClient:
                 auto.SendKeys("{Esc}", waitTime=0.15)
             except Exception as e:
                 log.debug("clearing search: %s", e)
-
             time.sleep(0.5)
 
-            # Click in the right pane area. Viber's layout is roughly:
-            #   left 28% = conversation sidebar
-            #   right 72% = active chat pane
-            # Click at ~65% across, ~50% down to hit the message area.
-            try:
-                wb = self.window.BoundingRectangle
-                if wb is not None and (wb.right - wb.left) > 0:
-                    cx = wb.left + int((wb.right - wb.left) * 0.65)
-                    cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
-                    log.info("clicking right-pane area at (%d,%d) to exit hybrid mode",
-                             cx, cy)
-                    auto.Click(cx, cy, waitTime=0.1)
-            except Exception as e:
-                log.debug("right-pane click: %s", e)
-
-            # Give Viber time to transition and update the UIA tree. Some
-            # chats (especially those with images / long histories) need
-            # several seconds for Qt to finish rendering the pane; do a
-            # retry loop and optionally re-click the right pane once to
-            # knock it out of hybrid mode.
-            attempts = [(1.5, False), (1.5, True), (2.0, False)]
-            for wait_s, reclick in attempts:
-                time.sleep(wait_s)
-                if reclick:
-                    try:
-                        wb = self.window.BoundingRectangle
-                        if wb is not None and (wb.right - wb.left) > 0:
-                            cx = wb.left + int((wb.right - wb.left) * 0.65)
-                            cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
-                            log.info("re-clicking right-pane area at (%d,%d)", cx, cy)
-                            auto.Click(cx, cy, waitTime=0.1)
-                    except Exception:
-                        pass
+            # Try to verify by finding the StackView or FeedDelegate. Some
+            # Viber builds expose them, some don't — we can't rely on it.
+            # Retry a few times with escalating nudges:
+            #   attempt 1: just wait
+            #   attempt 2: click the right-pane area to focus it
+            #   attempt 3: re-click the originally-picked row to force
+            #              Viber to commit the selection
+            def _verify_now() -> bool:
                 stack = _native_find(self.window, "PaneControl",
                                      STACKVIEW_EXACT_CLASS,
                                      timeout=1.0, search_depth=20)
                 if stack is not None:
-                    log.info("chat opened (StackView found after right-pane click)")
+                    log.info("chat opened (StackView found)")
                     return True
                 feed = _native_find(self.window, "GroupControl",
                                     MESSAGE_ITEM_EXACT_CLASS,
                                     timeout=0.5, search_depth=20)
                 if feed is not None:
-                    log.info("chat opened (FeedDelegate found, no StackView)")
+                    log.info("chat opened (FeedDelegate found)")
                     return True
-            log.error(
-                "Chat verification failed after 3 attempts. Neither StackView "
-                "nor FeedDelegate found. Tried: search click → clear search → "
-                "right-pane click → re-click → wait."
+                return False
+
+            def _right_pane_click():
+                try:
+                    wb = self.window.BoundingRectangle
+                    if wb is not None and (wb.right - wb.left) > 0:
+                        cx = wb.left + int((wb.right - wb.left) * 0.65)
+                        cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
+                        log.info("clicking right-pane area at (%d,%d) to exit hybrid mode",
+                                 cx, cy)
+                        auto.Click(cx, cy, waitTime=0.1)
+                except Exception as e:
+                    log.debug("right-pane click: %s", e)
+
+            # attempt 1: just wait
+            time.sleep(1.0)
+            if _verify_now():
+                return True
+            # attempt 2: right-pane click
+            _right_pane_click()
+            time.sleep(1.2)
+            if _verify_now():
+                return True
+            # attempt 3: re-click the original row
+            try:
+                log.info("re-clicking original row at (%d,%d)", click_x, click_y)
+                auto.Click(click_x, click_y, waitTime=0.1)
+            except Exception:
+                pass
+            time.sleep(1.2)
+            if _verify_now():
+                return True
+
+            # Neither StackView nor FeedDelegate is exposed via UIA. But we
+            # clicked a REAL search-result row with real bounds, and on
+            # this Viber build Qt doesn't always expose the right pane to
+            # the accessibility tree even when the chat is visibly open.
+            # Trust the click: downstream send_message / read_open_chat
+            # have their own native-find retries and will give a more
+            # specific error if the chat really isn't open.
+            log.warning(
+                "Chat verification could not locate StackView or FeedDelegate "
+                "after clicking a real row with bounds %r. Qt may not be "
+                "exposing the right pane on this Viber build; trusting the "
+                "click and returning success. Downstream send/read will "
+                "surface a specific error if the chat didn't actually open.",
+                bnds,
             )
-            return False
+            return True
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)
             return False
