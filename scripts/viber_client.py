@@ -537,17 +537,26 @@ class ViberClient:
             # Give the list time to re-filter
             time.sleep(0.7)
 
-            app = self._app_content()
-            if app is None:
-                log.error("ApplicationWindowContentControl not found after search")
-                return False
+            # Enumerate search-result delegates via native FindFirst foundIndex
+            # loop. This avoids GetChildren() recursion which corrupts Qt's
+            # accessibility tree (see #15).
+            all_rows = []
+            for i in range(1, 30):
+                try:
+                    ctrl = auto.GroupControl(
+                        searchFromControl=self.window,
+                        AutomationId="delegateLoader",
+                        foundIndex=i,
+                        searchDepth=20,
+                    )
+                    if not ctrl.Exists(0.0, 0):
+                        break
+                    all_rows.append(ctrl)
+                except Exception:
+                    break
 
-            all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=12)
             visible_rows = [r for r in all_rows if _is_visible(r)]
-            # De-duplicate: Qt UIA exposes each row at every nesting level of
-            # QQuickControl, so we get N rows * depth duplicates.
             visible_rows = _dedup_by_position(visible_rows)
-            # Sort topmost-first so the best search match is row[0].
             visible_rows.sort(key=lambda r: r.BoundingRectangle.top)
             log.info("after search %r: %d delegate(s) total, %d unique visible",
                      name, len(all_rows), len(visible_rows))
@@ -660,35 +669,67 @@ class ViberClient:
     def read_new_messages(self, name: str, limit: int = 20) -> list[ViberMessage]:
         """Read the last `limit` messages from the currently open chat.
 
-        Returns only those *after* the last one we remember seeing in this chat.
+        CRITICAL: this method uses ONLY native FindFirst-based lookups and
+        direct child navigation. Never calls GetChildren() or does recursive
+        tree walks — those corrupt Qt's accessibility tree and cause the
+        whole chat pane to disappear from UIA (see issue #15).
         """
         self._ensure_attached()
         if not self.open_conversation(name):
             return []
 
-        time.sleep(0.4)  # let Viber render the opened chat
+        time.sleep(0.5)  # let Viber render + Qt accessibility settle
 
-        # Messages are FeedDelegate GroupControls (confirmed via Accessibility
-        # Insights). Use UIA's native descendant search for reliability after
-        # the chat-open transition.
-        raw = _native_find_all(self.window, "GroupControl",
-                                r"FeedDelegate_QMLTYPE_\d+", search_depth=20)
-        # Dedup by screen position (Qt QQuickControl nesting causes duplicates)
-        items = _dedup_by_position(raw)
-        # Keep only visible ones, sort top-to-bottom
+        # Enumerate FeedDelegate GroupControls via foundIndex loop.
+        # Each iteration is a single IUIAutomation::FindFirst call, not a
+        # recursive walk, so Qt's tree stays healthy.
+        items: list = []
+        for i in range(1, limit * 2 + 5):
+            try:
+                ctrl = auto.GroupControl(
+                    searchFromControl=self.window,
+                    ClassName=MESSAGE_ITEM_EXACT_CLASS,
+                    foundIndex=i,
+                    searchDepth=20,
+                )
+                if not ctrl.Exists(0.0, 0):
+                    break
+                items.append(ctrl)
+            except Exception:
+                break
+
+        # Keep unique positions, sort top-to-bottom, keep newest N
+        items = _dedup_by_position(items)
         items = [i for i in items if _is_visible(i)]
         items.sort(key=lambda c: c.BoundingRectangle.top)
-        log.info("read_new_messages(%r): %d FeedDelegate total, %d unique visible",
-                 name, len(raw), len(items))
-        items = items[-limit:]  # most recent N
+        log.info("read_new_messages(%r): %d FeedDelegate visible", name, len(items))
+        items = items[-limit:]
 
         messages: list[ViberMessage] = []
-        for it in items:
-            text = _read_text(it)
+        for feed in items:
+            # Descend to the TextEditItem grandchild to read the message text.
+            # Use GetFirstChildControl() (direct COM call, not recursive) to
+            # get the inner EditControl whose ValuePattern has the text.
+            text = ""
+            try:
+                # Try first-child navigation first (cheapest)
+                child = feed.GetFirstChildControl()
+                while child is not None:
+                    if child.ControlTypeName == "EditControl":
+                        text = _read_text(child)
+                        if text:
+                            break
+                    child = child.GetNextSiblingControl()
+                # Fallback: read_text on the FeedDelegate itself
+                if not text:
+                    text = _read_text(feed)
+            except Exception as e:
+                log.debug("reading FeedDelegate failed: %s", e)
+                text = _read_text(feed)
             if not text:
                 continue
-            outgoing = any(h in (it.ClassName or "").lower() for h in OUTGOING_HINTS) \
-                or any(h in (it.AutomationId or "").lower() for h in OUTGOING_HINTS)
+            outgoing = any(h in (feed.ClassName or "").lower() for h in OUTGOING_HINTS) \
+                or any(h in (feed.AutomationId or "").lower() for h in OUTGOING_HINTS)
             sender = "me" if outgoing else name
             messages.append(ViberMessage(
                 conversation=name, sender=sender, text=text, outgoing=outgoing
@@ -721,28 +762,29 @@ class ViberClient:
 
     # ---- Sending ------------------------------------------------------
     def send_message(self, name: str, text: str) -> bool:
+        """Send a message using ONLY native FindFirst lookups (no GetChildren
+        recursion — that corrupts Qt's accessibility tree, see #15)."""
         self._ensure_attached()
         if not self.open_conversation_by_search(name):
             return False
-        stack = self._chat_stack()
-        if stack is None:
-            return False
-        inp = _find(stack, INPUT_BOX, timeout=1.5)
+        time.sleep(0.3)
+        # Native-find the input box and send button directly from the window
+        inp = _native_find(self.window, "EditControl", INPUT_BOX_EXACT_CLASS,
+                            timeout=2.0, search_depth=20)
         if inp is None:
-            log.error("Input box not found — check INPUT_BOX selector (expected QQuickTextEdit)")
+            log.error("Input box (QQuickTextEdit) not found after opening chat")
             return False
         try:
             inp.Click(simulateMove=False)
             time.sleep(0.15)
-            # Clear whatever's already typed
             auto.SendKeys("{Ctrl}a", waitTime=0.05)
             auto.SendKeys("{Delete}", waitTime=0.05)
-            # Paste (reliable for unicode/emojis)
             pyperclip.copy(text)
             auto.SendKeys("{Ctrl}v", waitTime=0.1)
             time.sleep(0.2)
-            # Prefer clicking the Send button; fall back to Enter.
-            send_btn = _find(stack, SEND_BUTTON, timeout=0.5)
+            send_btn = _native_find(self.window, "ButtonControl",
+                                     "SendToolbarButton",
+                                     timeout=0.5, search_depth=20)
             if send_btn is not None:
                 send_btn.Click(simulateMove=False)
             else:
