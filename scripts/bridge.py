@@ -132,52 +132,45 @@ class Bridge:
                 pass
 
     async def _scan_viber(self):
+        """Poll every *mapped* Viber chat for new messages.
+
+        We can't reliably detect unread counts across the conversation list
+        because Viber's delegate rows don't expose their contact name via
+        UIA. So instead we iterate over chats that have already been paired
+        to a Matrix room (via \x60!pair\x60 in the control room) and read each.
+        """
         if self.viber.window is None:
             try:
                 self.viber.attach()
             except ViberError:
                 return
 
-        convs = self.viber.list_conversations()
-        for c in convs:
-            if c.unread <= 0:
-                continue
-            await self._handle_unread(c.name, c.unread)
-
-    async def _handle_unread(self, viber_name: str, unread_count: int):
-        log.info("unread in %r: %d", viber_name, unread_count)
-        limit = max(unread_count + 2, self.cfg["bridge"].get("max_backfill_per_chat", 5))
-        messages = self.viber.read_new_messages(viber_name, limit=limit)
-        if not messages:
+        mappings = await self.state.list_mappings()
+        if not mappings:
             return
-
-        # Ensure a Matrix room exists
-        room_id = await self.state.get_room_for_viber(viber_name)
-        if room_id is None:
-            room_id = await self.matrix.create_bridge_room(viber_name)
-            await self.state.set_mapping(viber_name, room_id)
-            # Announce in control room
-            await self.matrix.send_notice(
-                self.cfg["matrix"]["control_room_id"],
-                f"📨 New Viber chat mapped: {viber_name} → {room_id}",
-            )
-
-        for m in messages:
-            h = hash_msg(viber_name, m.sender, m.text)
-            if await self.state.seen(h):
-                continue
-
-            if m.outgoing:
-                # Message we (or another Viber client) sent — just mark seen
-                await self.state.mark_seen(h, "viber->matrix")
-                continue
-
-            body = f"{m.sender}: {m.text}"
+        limit = self.cfg["bridge"].get("max_backfill_per_chat", 5)
+        for viber_name, room_id in mappings:
             try:
-                await self.matrix.send_text(room_id, body)
-                await self.state.mark_seen(h, "viber->matrix")
+                messages = self.viber.read_new_messages(viber_name, limit=limit)
             except Exception:
-                log.exception("failed to post to Matrix")
+                log.exception("reading %r failed", viber_name)
+                continue
+            if not messages:
+                continue
+            for m in messages:
+                h = hash_msg(viber_name, m.sender, m.text)
+                if await self.state.seen(h):
+                    continue
+                if m.outgoing:
+                    # Message we (or another Viber client) sent — mark seen silently
+                    await self.state.mark_seen(h, "viber->matrix")
+                    continue
+                body = f"{m.sender}: {m.text}"
+                try:
+                    await self.matrix.send_text(room_id, body)
+                    await self.state.mark_seen(h, "viber->matrix")
+                except Exception:
+                    log.exception("failed to post to Matrix")
 
     # ---- Matrix→Viber -------------------------------------------------
     async def _on_matrix_message(self, room_id: str, sender: str, body: str):
@@ -206,9 +199,11 @@ class Bridge:
                 "Commands:\n"
                 "  !status — bridge & Viber status\n"
                 "  !list — mapped Viber chats\n"
-                "  !scan — list Viber conversations visible right now\n"
-                "  !pair <!room_id> <viber name> — manually pair\n"
+                "  !scan — count of visible Viber conversation rows (names not readable)\n"
+                "  !addchat <viber name> — create a Matrix room for this Viber chat\n"
+                "  !pair <!room_id> <viber name> — manually pair an existing room\n"
                 "  !unpair <viber name> — remove pairing\n"
+                "  !test <viber name> — try navigating to a chat and reading messages\n"
                 "  !reload — re-attach to Viber\n"
             )
         if cmd == "status":
@@ -232,7 +227,40 @@ class Bridge:
                 return f"viber error: {e}"
             if not convs:
                 return "(no conversations detected — check selectors)"
-            return "\n".join(f"  [{c.unread}] {c.name}" for c in convs[:50])
+            return (f"{len(convs)} conversation row(s) visible.\n"
+                    f"Note: Viber doesn't expose contact names on row delegates,\n"
+                    f"so use !addchat <name> or !pair to pair a specific chat.")
+        if cmd == "addchat":
+            if not args:
+                return "usage: !addchat <viber contact or group name>"
+            vname = " ".join(args)
+            existing = await self.state.get_room_for_viber(vname)
+            if existing:
+                return f"already paired: {vname!r} → {existing}"
+            # Verify we can actually reach that chat before creating a room
+            if not self.viber.open_conversation_by_search(vname):
+                return f"could not find a Viber chat matching {vname!r}"
+            room_id = await self.matrix.create_bridge_room(vname)
+            await self.state.set_mapping(vname, room_id)
+            return f"created & paired: {vname!r} → {room_id}"
+        if cmd == "test":
+            if not args:
+                return "usage: !test <viber contact or group name>"
+            vname = " ".join(args)
+            try:
+                opened = self.viber.open_conversation_by_search(vname)
+                if not opened:
+                    return f"could not open {vname!r}"
+                msgs = self.viber.read_new_messages(vname, limit=5)
+                if not msgs:
+                    return f"opened {vname!r} but no messages read (check MESSAGE_ITEM selector)"
+                lines = [f"opened {vname!r}, read {len(msgs)} recent message(s):"]
+                for m in msgs[-5:]:
+                    d = "→" if m.outgoing else "←"
+                    lines.append(f"  {d} {m.text[:80]}")
+                return "\n".join(lines)
+            except Exception as e:
+                return f"test failed: {e}"
         if cmd == "pair":
             if len(args) < 2:
                 return "usage: !pair <!room_id> <viber name...>"

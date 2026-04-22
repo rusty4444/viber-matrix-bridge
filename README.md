@@ -181,12 +181,30 @@ To remove: `uninstall-service.bat`.
 
 | Command | Effect |
 |---|---|
-| `!status` | Show uptime, Viber connection state, last message timestamps |
-| `!list` | List Viber conversations detected and their mapped rooms |
-| `!pair <#room-alias or !id> <viber-conversation-name>` | Manually pair a Matrix room to a Viber chat |
-| `!unpair <viber-conversation-name>` | Remove a pairing |
-| `!reload` | Re-scan Viber conversation list |
 | `!help` | Show commands |
+| `!status` | Uptime, Viber attachment state, number of paired chats |
+| `!list` | List currently paired chats |
+| `!scan` | Count of visible conversation rows (names are not readable — see below) |
+| `!addchat <viber name>` | Navigate to a Viber chat by name; create & pair a new Matrix room if found |
+| `!pair <!room_id> <viber name>` | Pair an existing Matrix room to a Viber chat manually |
+| `!unpair <viber name>` | Remove a pairing |
+| `!test <viber name>` | Open a chat and read the last 5 messages (diagnostic) |
+| `!reload` | Re-attach to the Viber window |
+
+### Why you have to pair chats explicitly
+
+Viber Desktop is a Qt/QML app. Its conversation-row controls expose no
+contact name or children to Windows UI Automation — we can see that 4 rows
+exist, but not who each row represents. So the bridge can't "auto-discover
+ unread chats" the way a real mautrix bridge does.
+
+Instead, you tell the bridge about each chat you want to bridge:
+
+1. `!addchat Alice` — bridge types "Alice" into Viber's search box, clicks
+   the first matching result, and if that works, creates a Matrix room for
+   that chat.
+2. From then on, the bridge polls that specific chat every few seconds by
+   searching for its name again.
 
 ## Limits & caveats (read these)
 

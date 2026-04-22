@@ -32,15 +32,14 @@ from viber_selectors import (
     MAIN_WINDOW,
     APP_CONTENT,
     SPLIT_VIEW,
-    SIDEBAR_CONTENT,
     CHAT_STACK,
-    CONVERSATION_ITEM,
-    UNREAD_BADGE,
-    CHAT_HEADER_TITLE,
-    MESSAGE_LIST,
+    CHAT_INFO_PANEL,
+    SEARCH_BOX,
+    CONVERSATION_ROW,
     MESSAGE_ITEM,
     INPUT_BOX,
     SEND_BUTTON,
+    SCROLL_TO_BOTTOM,
     OUTGOING_HINTS,
 )
 
@@ -142,6 +141,42 @@ def _collect(parent, selector, results, recursive: bool, max_depth: int, depth: 
             results.append(c)
         if recursive and depth < max_depth:
             _collect(c, selector, results, recursive=True, max_depth=max_depth, depth=depth + 1)
+
+
+def _read_text(el) -> str:
+    """Extract text content from a UIA element.
+
+    Viber's message bubbles are EditControls (TextEditItem_QMLTYPE_*) that
+    expose their content through the Value pattern, not the Name property.
+    Falls back to Name if Value is unavailable.
+    """
+    try:
+        # 1. ValuePattern (for Edit-style controls)
+        vp = el.GetValuePattern()
+        if vp is not None:
+            v = vp.Value
+            if v:
+                return v.strip()
+    except Exception:
+        pass
+    try:
+        # 2. TextPattern (for read-only document ranges)
+        tp = el.GetTextPattern()
+        if tp is not None:
+            doc = tp.DocumentRange
+            t = doc.GetText(-1)
+            if t:
+                return t.strip()
+    except Exception:
+        pass
+    # 3. Name property (last resort)
+    try:
+        n = el.Name
+        if n:
+            return n.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _walk(element, depth=0, max_depth=8):
@@ -297,78 +332,82 @@ class ViberClient:
             except Exception as e:
                 print(f"{indent}- <error: {e}>")
 
-    # ---- Conversations ------------------------------------------------
-    def _sidebar(self):
-        """Return the left-side SideBarContent pane, or None."""
-        return _find(self.window, SIDEBAR_CONTENT, timeout=2.0)
+    # ---- Top-level panes --------------------------------------------
+    def _app_content(self):
+        return _find(self.window, APP_CONTENT, timeout=2.0)
 
     def _chat_stack(self):
         """Return the right-side StackView (active chat pane), or None."""
         return _find(self.window, CHAT_STACK, timeout=2.0)
 
-    def _extract_row_label(self, row) -> str:
-        """Pull the contact/group name out of a conversation row.
-        Viber doesn't set Name on the delegate itself, so we descend and pick
-        up the first non-empty TextControl."""
-        if row.Name:
-            return row.Name.splitlines()[0].strip()
-        # Walk children, pick first TextControl with text
-        try:
-            for depth, el in _walk(row, max_depth=6):
-                if el is row:
-                    continue
-                if el.ControlTypeName == "TextControl" and (el.Name or "").strip():
-                    return el.Name.strip().splitlines()[0].strip()
-        except Exception:
-            pass
-        return ""
+    def _search_box(self):
+        return _find(self.window, SEARCH_BOX, timeout=1.5)
 
+    # ---- Conversation navigation ------------------------------------
     def list_conversations(self) -> list[ViberConversation]:
+        """Return the visible conversation rows.
+
+        NOTE: Viber's conversation-row delegates don't expose contact names
+        via UIA (Name='' and no children). So this only returns row indices
+        as stand-in names (e.g. "row:0"). Use this for *counting* visible
+        rows, not for identifying who each chat is with. Use
+        :meth:`open_conversation_by_search` to navigate by contact name.
+        """
         self._ensure_attached()
-        sidebar = self._sidebar()
-        if sidebar is None:
-            log.warning("Sidebar not found — check SIDEBAR_CONTENT selector")
+        app = self._app_content()
+        if app is None:
+            log.warning("Could not find ApplicationWindowContentControl")
             return []
+        rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=4)
+        return [ViberConversation(name=f"row:{i}", unread=0)
+                for i in range(len(rows))]
 
-        rows = _find_all(sidebar, CONVERSATION_ITEM, recursive=True, max_depth=6)
-        convs: list[ViberConversation] = []
-        for row in rows:
-            label = self._extract_row_label(row)
-            if not label:
-                continue
-            # Look for a numeric unread badge anywhere in the row subtree
-            unread = 0
-            badges = _find_all(row, UNREAD_BADGE, recursive=True, max_depth=6)
-            for b in badges:
-                try:
-                    unread = max(unread, int((b.Name or "").strip()))
-                except ValueError:
-                    continue
-            convs.append(ViberConversation(name=label, unread=unread))
-        return convs
+    def open_conversation_by_search(self, name: str) -> bool:
+        """Navigate to the chat with the given contact / group by typing the
+        name into Viber's top search box and clicking the first result.
 
-    def open_conversation(self, name: str) -> bool:
+        This is the only reliable way to open a specific chat, because
+        conversation-row delegates expose no contact names via UIA.
+        """
         self._ensure_attached()
-        sidebar = self._sidebar()
-        if sidebar is None:
-            return False
-        rows = _find_all(sidebar, CONVERSATION_ITEM, recursive=True, max_depth=6)
-        target = None
-        lname = name.lower()
-        for row in rows:
-            if self._extract_row_label(row).lower() == lname:
-                target = row
-                break
-        if target is None:
-            log.warning("Conversation %r not found", name)
+        search = self._search_box()
+        if search is None:
+            log.error("Search box not found — check SEARCH_BOX selector")
             return False
         try:
-            target.Click(simulateMove=False)
-            time.sleep(self.cfg.get("click_pause_ms", 150) / 1000.0)
+            search.Click(simulateMove=False)
+            time.sleep(0.15)
+            # Clear anything currently in the box
+            auto.SendKeys("{Ctrl}a", waitTime=0.05)
+            auto.SendKeys("{Delete}", waitTime=0.05)
+            # Paste the query via clipboard (unicode-safe)
+            pyperclip.copy(name)
+            auto.SendKeys("{Ctrl}v", waitTime=0.1)
+            # Wait for the conversation list to re-filter
+            time.sleep(0.5)
+            # Click the first visible conversation row
+            app = self._app_content()
+            if app is None:
+                return False
+            rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=4)
+            if not rows:
+                log.warning("No conversation rows visible after search for %r", name)
+                return False
+            first = rows[0]
+            first.Click(simulateMove=False)
+            time.sleep(self.cfg.get("click_pause_ms", 300) / 1000.0)
+            # Clear the search so the list returns to normal
+            search.Click(simulateMove=False)
+            auto.SendKeys("{Ctrl}a", waitTime=0.05)
+            auto.SendKeys("{Delete}", waitTime=0.05)
             return True
         except Exception as e:
-            log.error("Click failed on %r: %s", name, e)
+            log.error("open_conversation_by_search(%r) failed: %s", name, e)
             return False
+
+    # Keep the old name as an alias for bridge.py compatibility.
+    def open_conversation(self, name: str) -> bool:
+        return self.open_conversation_by_search(name)
 
     # ---- Reading messages --------------------------------------------
     def read_new_messages(self, name: str, limit: int = 20) -> list[ViberMessage]:
@@ -380,27 +419,23 @@ class ViberClient:
         if not self.open_conversation(name):
             return []
 
-        time.sleep(0.3)  # let Viber render
-        stack = self._chat_stack() or self.window
-        msg_list = _find(stack, MESSAGE_LIST, timeout=1.5)
-        if msg_list is None:
-            log.warning("Message list not found — check MESSAGE_LIST selector")
+        time.sleep(0.4)  # let Viber render the opened chat
+        stack = self._chat_stack()
+        if stack is None:
+            log.warning("Active chat StackView not found")
             return []
 
-        items = _find_all(msg_list, MESSAGE_ITEM, recursive=True, max_depth=4)
-        if not items:
-            # Fallback: any child control with a non-empty Name
-            items = [c for c in msg_list.GetChildren() if (c.Name or "").strip()]
-        items = items[-limit:]  # most recent N
+        # Messages are TextEditItem EditControls directly inside the StackView.
+        items = _find_all(stack, MESSAGE_ITEM, recursive=True, max_depth=4)
+        items = items[-limit:]  # most recent N visible bubbles
 
         messages: list[ViberMessage] = []
         for it in items:
-            text = (it.Name or "").strip()
+            text = _read_text(it)
             if not text:
                 continue
-            # Try to detect outgoing vs incoming via class/automation hints
             outgoing = any(h in (it.ClassName or "").lower() for h in OUTGOING_HINTS) \
-                    or any(h in (it.AutomationId or "").lower() for h in OUTGOING_HINTS)
+                or any(h in (it.AutomationId or "").lower() for h in OUTGOING_HINTS)
             sender = "me" if outgoing else name
             messages.append(ViberMessage(
                 conversation=name, sender=sender, text=text, outgoing=outgoing
@@ -434,24 +469,31 @@ class ViberClient:
     # ---- Sending ------------------------------------------------------
     def send_message(self, name: str, text: str) -> bool:
         self._ensure_attached()
-        if not self.open_conversation(name):
+        if not self.open_conversation_by_search(name):
             return False
-        stack = self._chat_stack() or self.window
+        stack = self._chat_stack()
+        if stack is None:
+            return False
         inp = _find(stack, INPUT_BOX, timeout=1.5)
         if inp is None:
-            log.error("Input box not found — check INPUT_BOX selector")
+            log.error("Input box not found — check INPUT_BOX selector (expected QQuickTextEdit)")
             return False
         try:
             inp.Click(simulateMove=False)
-            time.sleep(0.1)
-            # Clear existing
+            time.sleep(0.15)
+            # Clear whatever's already typed
             auto.SendKeys("{Ctrl}a", waitTime=0.05)
             auto.SendKeys("{Delete}", waitTime=0.05)
-            # Paste from clipboard — much more reliable for unicode than SendKeys
+            # Paste (reliable for unicode/emojis)
             pyperclip.copy(text)
             auto.SendKeys("{Ctrl}v", waitTime=0.1)
-            time.sleep(0.1)
-            auto.SendKeys("{Enter}", waitTime=0.05)
+            time.sleep(0.2)
+            # Prefer clicking the Send button; fall back to Enter.
+            send_btn = _find(stack, SEND_BUTTON, timeout=0.5)
+            if send_btn is not None:
+                send_btn.Click(simulateMove=False)
+            else:
+                auto.SendKeys("{Enter}", waitTime=0.05)
             return True
         except Exception as e:
             log.error("send_message failed: %s", e)
