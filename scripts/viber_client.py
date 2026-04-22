@@ -466,10 +466,15 @@ class ViberClient:
         return matches[0] if matches else None
 
     def _search_box(self):
-        # Native search for the top TextFieldItem (search box)
-        matches = _native_find_all(self.window, "EditControl",
-                                    r"TextFieldItem_QMLTYPE_\d+", search_depth=12)
-        return matches[0] if matches else _find(self.window, SEARCH_BOX, timeout=1.5)
+        """Find the top search box via a SINGLE native FindFirst call.
+        Do NOT use foundIndex iteration — that enumerates all EditControls
+        including message TextEditItems, potentially triggering Qt to
+        render / rebuild them and degrade the accessibility tree.
+        """
+        # Exact class name first (fast path)
+        s = _native_find(self.window, "EditControl", "TextFieldItem_QMLTYPE_94",
+                          timeout=1.5, search_depth=10)
+        return s
 
     # ---- Conversation navigation ------------------------------------
     def list_conversations(self) -> list[ViberConversation]:
@@ -587,75 +592,45 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Let the click register
+            # Let the click register, then dismiss search mode with plain
+            # keyboard input only — avoid UIA clicks here because they can
+            # further perturb Qt's accessibility state.
             time.sleep(0.4)
-
-            # CRITICAL: clear search BEFORE trying to verify that the chat
-            # opened. Viber keeps the search bar active after clicking a
-            # result — the StackView/chat controls are only restored to
-            # the UIA tree once search mode is fully dismissed.
             try:
-                # Escape usually exits search mode
-                auto.SendKeys("{Esc}", waitTime=0.1)
-                time.sleep(0.2)
-                # Also explicitly clear the search box in case Escape didn't
-                search.Click(simulateMove=False)
+                auto.SendKeys("{Esc}", waitTime=0.15)
+                # Ctrl+A + Delete in the currently-focused control (still the
+                # search box usually) to clear any residual text.
                 auto.SendKeys("{Ctrl}a", waitTime=0.05)
                 auto.SendKeys("{Delete}", waitTime=0.1)
-                auto.SendKeys("{Esc}", waitTime=0.1)
+                auto.SendKeys("{Esc}", waitTime=0.15)
             except Exception as e:
-                log.debug("clearing search after click: %s", e)
+                log.debug("clearing search: %s", e)
 
-            # Give Viber time to exit search mode and restore the chat pane
-            # in the UIA tree.
-            time.sleep(0.8)
+            # Wait for Viber to exit search mode and settle its UIA tree.
+            # This sleep is important — without it, FindFirst will hit the
+            # transient tree that doesn't yet include the chat pane.
+            time.sleep(1.5)
 
-            # Look for ANY of: the active-chat StackView, OR the message input
-            # box (QQuickTextEdit), OR a FeedDelegate (message bubble). Any of
-            # these indicates the chat pane is actually open. Uses UIA's
-            # native FindFirst which returns fresh results after UI state
-            # changes (unlike our recursive GetChildren walker).
-            stack = None
-            input_box = None
-            feed = None
-            deadline = time.monotonic() + 6.0
-            while time.monotonic() < deadline:
-                stack = self._chat_stack(timeout=0.3)
-                if stack is not None:
-                    input_box = _native_find(stack, "EditControl",
-                                              INPUT_BOX_EXACT_CLASS,
-                                              timeout=0.3, search_depth=10)
-                    if input_box is not None:
-                        break
-                # Look for input box anywhere in window
-                input_box = _native_find(self.window, "EditControl",
-                                          INPUT_BOX_EXACT_CLASS,
-                                          timeout=0.3, search_depth=20)
-                if input_box is not None and _is_visible(input_box):
-                    break
-                # Or: any FeedDelegate (a message is rendered)
+            # Single FindFirst for the chat pane (StackView or FeedDelegate).
+            # NO polling loop, NO multiple simultaneous searches — each extra
+            # UIA call risks degrading Qt's tree.
+            stack = _native_find(self.window, "PaneControl",
+                                  STACKVIEW_EXACT_CLASS,
+                                  timeout=2.0, search_depth=20)
+            if stack is None:
+                # Only if StackView missing, try one fallback: a FeedDelegate.
                 feed = _native_find(self.window, "GroupControl",
                                      MESSAGE_ITEM_EXACT_CLASS,
-                                     timeout=0.3, search_depth=20)
-                if feed is not None and _is_visible(feed):
-                    break
-                time.sleep(0.2)
-
-            chat_is_open = (
-                stack is not None
-                or (input_box is not None and _is_visible(input_box))
-                or (feed is not None and _is_visible(feed))
-            )
-            if not chat_is_open:
-                log.error(
-                    "Chat didn't open within 6s. None of StackView, visible "
-                    "input box, or FeedDelegate found after clearing search. "
-                    "If Viber's right pane shows a Channel viewer or 'info' "
-                    "panel, the top search result wasn't a real Conversation."
-                )
-                return False
-            log.info("chat opened successfully (stack=%s, input=%s, feed=%s)",
-                     bool(stack), bool(input_box), bool(feed))
+                                     timeout=1.0, search_depth=20)
+                if feed is None:
+                    log.error(
+                        "Chat verification failed after search-clear. "
+                        "StackView and FeedDelegate both absent from UIA tree."
+                    )
+                    return False
+                log.info("chat opened (verified via FeedDelegate)")
+            else:
+                log.info("chat opened (verified via StackView)")
             return True
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)

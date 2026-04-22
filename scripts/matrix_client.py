@@ -88,11 +88,18 @@ class MatrixClient:
 
     # ---- Event dispatch ----------------------------------------------
     async def _on_event(self, room: MatrixRoom, event: RoomMessageText):
+        # Skip historical events replayed on startup. The initial sync
+        # delivers all unprocessed room history — we only want new messages.
+        if hasattr(event, "server_timestamp") and \
+                event.server_timestamp < self._start_ms - 5000:
+            return
         # Ignore our own echoes
         if event.sender == self.client.user_id:
             return
         # Only accept from admin
         if event.sender != self.admin:
+            log.debug("ignoring message from non-admin %s (expected %s)",
+                      event.sender, self.admin)
             return
 
         body = (event.body or "").strip()
