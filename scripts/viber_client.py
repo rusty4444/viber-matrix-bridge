@@ -923,15 +923,63 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
         print("\n[6] StackView not found by any method. Content dump skipped.")
 
 
+def _inspect_active_main():
+    """Inspect the CURRENTLY OPEN Viber chat without doing any navigation.
+
+    Run this while Viber is already showing a chat you've opened manually
+    (don't use any other --inspect commands first). This tests whether
+    uiautomation's native FindFirst can see the chat pane in a clean state
+    (no prior GetChildren() tree-walking by our script).
+    """
+    c = ViberClient({"window_title": "Viber"})
+    c.attach()   # this only does GetRootControl + iterates top-level windows
+    print("Testing native FindFirst finds (no GetChildren tree-walking):")
+    print()
+
+    stack = _native_find(c.window, "PaneControl", STACKVIEW_EXACT_CLASS, timeout=3.0, search_depth=20)
+    print(f"  StackView_QMLTYPE_463 :  {stack}")
+    feed  = _native_find(c.window, "GroupControl", MESSAGE_ITEM_EXACT_CLASS, timeout=3.0, search_depth=20)
+    print(f"  FeedDelegate_QMLTYPE  :  {feed}")
+    inp   = _native_find(c.window, "EditControl",  INPUT_BOX_EXACT_CLASS,   timeout=3.0, search_depth=20)
+    print(f"  QQuickTextEdit        :  {inp}")
+    send  = _native_find(c.window, "ButtonControl", "SendToolbarButton",     timeout=3.0, search_depth=20)
+    print(f"  SendToolbarButton     :  {send}")
+
+    print()
+    print("Shallow tree dump (max_depth=4) — VIS = non-zero bounds:")
+    for depth, el in _walk(c.window, max_depth=4):
+        indent = "  " * depth
+        vis = "VIS" if _is_visible(el) else "   "
+        try:
+            ctype = el.ControlTypeName
+            cls   = el.ClassName or ""
+            b     = el.BoundingRectangle
+            bs    = f"{b.left},{b.top},{b.right-b.left}x{b.bottom-b.top}" if b else "-"
+        except Exception:
+            continue
+        print(f"{indent}[{vis}] {ctype:20s} {cls:50s} rect={bs}")
+
+    if stack:
+        print("\nStackView found! Value-pattern dump of its children:")
+        _dump_content(stack, max_depth=4)
+    elif feed:
+        print("\nFeedDelegate found (no StackView). ValuePattern dump:")
+        print(f"  text = {_read_text(feed)!r}")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     argv = sys.argv[1:]
+    if argv and argv[0] == "--inspect-active":
+        _inspect_active_main()
+        sys.exit(0)
+
     if argv and argv[0] == "--inspect-chat":
         if len(argv) < 2:
             print("usage: viber_client.py --inspect-chat <contact-name> [max_depth=15]")
             sys.exit(1)
-        depth = int(argv[2]) if len(argv) > 2 else 15
+        depth = int(argv[2]) if len(argv) > 2 else 8
         _inspect_chat_main(argv[1], max_depth=depth)
         sys.exit(0)
 
