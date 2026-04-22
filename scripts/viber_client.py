@@ -495,6 +495,43 @@ class ViberClient:
         return [ViberConversation(name=f"row:{i}", unread=0)
                 for i in range(len(rows))]
 
+    def _clear_search_if_open(self):
+        """If the top search box has text in it, Viber hides the chat pane
+        and shows search results instead — FeedDelegates in the chat are
+        either not in the UIA tree or occluded. Clear it defensively before
+        any read/navigate op.
+
+        Uses keyboard only (Esc + Ctrl+A + Delete + Esc) — no UIA clicks,
+        because clicking the search box and clearing it from UIA causes
+        Qt's accessibility tree to rebuild (see issue #15).
+        """
+        try:
+            search = self._search_box()
+            if search is None:
+                return
+            # Read the current value. If empty, nothing to do.
+            current = ""
+            try:
+                vp = search.GetValuePattern()
+                current = (vp.Value or "") if vp is not None else ""
+            except Exception:
+                current = ""
+            if not current.strip():
+                return
+            log.info("clearing stale search text %r before op", current[:40])
+            # Focus the search box, clear, then Esc to dismiss search mode.
+            try:
+                search.Click(simulateMove=False)
+                time.sleep(0.1)
+                auto.SendKeys("{Ctrl}a", waitTime=0.05)
+                auto.SendKeys("{Delete}", waitTime=0.05)
+                auto.SendKeys("{Esc}", waitTime=0.15)
+                time.sleep(0.4)
+            except Exception as e:
+                log.debug("clear_search keyboard sequence failed: %s", e)
+        except Exception as e:
+            log.debug("_clear_search_if_open error: %s", e)
+
     def _focus_window(self):
         """Bring the Viber window to the foreground so UIA can actually click.
         Qt renders delegates lazily — off-screen / unfocused windows often
@@ -526,6 +563,9 @@ class ViberClient:
         self._ensure_attached()
         self._focus_window()
         time.sleep(0.1)
+        # Belt-and-braces: if a previous failed addchat left residual
+        # search text, the first keystroke below would append to it.
+        self._clear_search_if_open()
 
         search = self._search_box()
         if search is None:
@@ -652,25 +692,40 @@ class ViberClient:
             except Exception as e:
                 log.debug("right-pane click: %s", e)
 
-            # Give Viber time to transition and update the UIA tree.
-            time.sleep(1.5)
-
-            # Single FindFirst for the chat pane.
-            stack = _native_find(self.window, "PaneControl",
-                                  STACKVIEW_EXACT_CLASS,
-                                  timeout=2.0, search_depth=20)
-            if stack is not None:
-                log.info("chat opened (StackView found after right-pane click)")
-                return True
-            feed = _native_find(self.window, "GroupControl",
-                                 MESSAGE_ITEM_EXACT_CLASS,
-                                 timeout=1.0, search_depth=20)
-            if feed is not None:
-                log.info("chat opened (FeedDelegate found, no StackView)")
-                return True
+            # Give Viber time to transition and update the UIA tree. Some
+            # chats (especially those with images / long histories) need
+            # several seconds for Qt to finish rendering the pane; do a
+            # retry loop and optionally re-click the right pane once to
+            # knock it out of hybrid mode.
+            attempts = [(1.5, False), (1.5, True), (2.0, False)]
+            for wait_s, reclick in attempts:
+                time.sleep(wait_s)
+                if reclick:
+                    try:
+                        wb = self.window.BoundingRectangle
+                        if wb is not None and (wb.right - wb.left) > 0:
+                            cx = wb.left + int((wb.right - wb.left) * 0.65)
+                            cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
+                            log.info("re-clicking right-pane area at (%d,%d)", cx, cy)
+                            auto.Click(cx, cy, waitTime=0.1)
+                    except Exception:
+                        pass
+                stack = _native_find(self.window, "PaneControl",
+                                     STACKVIEW_EXACT_CLASS,
+                                     timeout=1.0, search_depth=20)
+                if stack is not None:
+                    log.info("chat opened (StackView found after right-pane click)")
+                    return True
+                feed = _native_find(self.window, "GroupControl",
+                                    MESSAGE_ITEM_EXACT_CLASS,
+                                    timeout=0.5, search_depth=20)
+                if feed is not None:
+                    log.info("chat opened (FeedDelegate found, no StackView)")
+                    return True
             log.error(
-                "Chat verification failed. Neither StackView nor FeedDelegate "
-                "found. Tried: search click → clear search → right-pane click."
+                "Chat verification failed after 3 attempts. Neither StackView "
+                "nor FeedDelegate found. Tried: search click → clear search → "
+                "right-pane click → re-click → wait."
             )
             return False
         except Exception as e:
@@ -685,8 +740,15 @@ class ViberClient:
         """Read messages from WHATEVER chat is currently open in Viber.
         Does not navigate — uses only native FindFirst to enumerate the
         currently-visible FeedDelegate controls and read their ValuePattern.
+
+        Before reading, clears any residual search text (which would hide
+        the chat pane behind search results) and briefly focuses the window
+        so Qt renders the delegate rows.
         """
         self._ensure_attached()
+        self._focus_window()
+        self._clear_search_if_open()
+        time.sleep(0.2)
         return self._read_open_chat(conversation_label or "<current>", limit)
 
     # ---- Reading messages --------------------------------------------
@@ -731,6 +793,30 @@ class ViberClient:
         items = [i for i in items if _is_visible(i)]
         items.sort(key=lambda c: c.BoundingRectangle.top)
         log.info("read_new_messages(%r): %d FeedDelegate visible", name, len(items))
+        if not items:
+            # Diagnose why nothing was found so we can tell the caller
+            # whether to complain about search state, window focus, or a
+            # genuinely empty chat.
+            try:
+                sb = self._search_box()
+                sb_val = ""
+                if sb is not None:
+                    try:
+                        vp = sb.GetValuePattern()
+                        sb_val = (vp.Value or "") if vp is not None else ""
+                    except Exception:
+                        pass
+                stack = _native_find(self.window, "PaneControl",
+                                     STACKVIEW_EXACT_CLASS,
+                                     timeout=0.5, search_depth=20)
+                log.warning(
+                    "read_new_messages(%r) empty — search_box=%r stackview=%s "
+                    "(if search_box is non-empty, a previous op left Viber in "
+                    "search mode; if stackview is None, no chat is open)",
+                    name, sb_val[:40], "present" if stack is not None else "absent",
+                )
+            except Exception:
+                pass
         items = items[-limit:]
 
         # Geometry-based direction detection. Viber right-aligns outgoing
