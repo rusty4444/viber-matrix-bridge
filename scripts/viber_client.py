@@ -1208,14 +1208,62 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
     print("\n[2] Clicking first visible search result...")
     app = c._app_content()
     all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=12)
-    visible = _dedup_by_position([r for r in all_rows if _is_visible(r)])
-    visible.sort(key=lambda r: r.BoundingRectangle.top)
-    if not visible:
-        print("    No visible rows found.")
+    print(f"    _find_all returned {len(all_rows)} raw CONVERSATION_ROW candidates")
+    # Cache bounds + class + name INLINE to avoid Qt's stale-proxy bug
+    # where re-reading BoundingRectangle returns zero-area rects.
+    captured = []
+    for rr in all_rows:
+        try:
+            b = rr.BoundingRectangle
+            if b is None:
+                continue
+            bn = (b.left, b.top, b.right, b.bottom)
+            if bn[2] - bn[0] <= 0 or bn[3] - bn[1] <= 0:
+                continue
+            cls = (rr.ClassName or "")
+            nm  = (rr.Name or "").strip()
+            captured.append((rr, bn, cls, nm))
+        except Exception:
+            continue
+    # dedup by (left, top)
+    seen = set()
+    unique = []
+    for tup in captured:
+        key = (tup[1][0], tup[1][1])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(tup)
+    unique.sort(key=lambda t: t[1][1])
+    print(f"    after visibility + dedup: {len(unique)} unique rows")
+    for idx, (_r, bn, cls, nm) in enumerate(unique):
+        print(f"      row[{idx}] name={nm!r:20s} bounds=({bn[0]},{bn[1]},{bn[2]},{bn[3]}) cls={cls!r}")
+    if not unique:
+        print("    No visible rows found. Falling back to sidebar-scan diagnostic:")
+        # Last-ditch: enumerate delegateLoader GroupControls anywhere in
+        # the window, print everything, so we can see what's actually there.
+        for i in range(1, 40):
+            try:
+                ctrl = auto.GroupControl(
+                    searchFromControl=c.window,
+                    AutomationId="delegateLoader",
+                    foundIndex=i,
+                    searchDepth=4,
+                )
+                if not ctrl.Exists(0.0, 0):
+                    break
+                cls = (ctrl.ClassName or "")
+                b = ctrl.BoundingRectangle
+                bs = f"({b.left},{b.top},{b.right},{b.bottom})" if b else "no-rect"
+                nm = (ctrl.Name or "").strip()
+                print(f"      [{i}] name={nm!r:20s} bounds={bs} cls={cls!r}")
+            except Exception as e:
+                print(f"      [{i}] error: {e}")
+                break
         return
-    r0 = visible[0]
-    cx, cy = r0.BoundingRectangle.left + 50, r0.BoundingRectangle.top + 30
-    print(f"    Clicking ({cx},{cy}) — first of {len(visible)} visible rows")
+    r0, bn, _cls, _nm = unique[0]
+    cx, cy = bn[0] + 50, bn[1] + 30
+    print(f"    Clicking ({cx},{cy}) — first of {len(unique)} unique rows (name={_nm!r})")
     auto.Click(cx, cy, waitTime=0.1)
     time.sleep(0.5)
 
