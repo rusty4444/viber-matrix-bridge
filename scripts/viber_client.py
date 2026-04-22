@@ -187,23 +187,80 @@ class ViberClient:
 
     # ---- Attachment ---------------------------------------------------
     def attach(self):
+        """Find the Viber Desktop window.
+
+        Matching priority:
+          1. A top-level WindowControl whose ClassName matches
+             ``MainWindow_QMLTYPE_\\d+`` (Viber's Qt QML main window class).
+             This is the **primary** signal — title substrings are unreliable
+             because any File Explorer window showing a folder named "viber"
+             will match a naive title search.
+          2. If no Qt match found, fall back to a title-substring match on the
+             configured ``window_title`` (default "Viber").
+        """
         if auto is None:
             raise ViberError("Install on Windows with uiautomation package.")
-        # Find the Viber main window
-        title_sub = self.cfg.get("window_title", "Viber")
-        root = auto.GetRootControl()
+
+        title_sub = self.cfg.get("window_title", "Viber").lower()
+        qt_class_re = re.compile(r"MainWindow_QMLTYPE_\d+")
+
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
+            root = auto.GetRootControl()
+            candidates: list[tuple[int, object]] = []   # (score, window)
             for w in root.GetChildren():
                 try:
-                    if w.ControlTypeName == "WindowControl" and title_sub.lower() in (w.Name or "").lower():
-                        self.window = w
-                        log.info("attached to Viber window: %r", w.Name)
-                        return
+                    if w.ControlTypeName != "WindowControl":
+                        continue
+                    name = (w.Name or "")
+                    cls = (w.ClassName or "")
+                    score = 0
+                    if qt_class_re.search(cls):
+                        score += 100   # strong: it's the Viber Qt main window
+                    if title_sub and title_sub in name.lower():
+                        score += 10
+                    if "viber" in cls.lower():
+                        score += 5
+                    # Negative signal: obvious non-Viber windows whose
+                    # titles accidentally contain 'viber'
+                    if cls in ("CabinetWClass", "Shell_TrayWnd", "Chrome_WidgetWin_1"):
+                        score -= 100
+                    if score > 0:
+                        candidates.append((score, w))
+                        log.debug("candidate window: score=%d class=%r name=%r",
+                                  score, cls, name)
                 except Exception:
-                    pass
+                    continue
+
+            if candidates:
+                candidates.sort(key=lambda t: t[0], reverse=True)
+                best_score, best = candidates[0]
+                if best_score >= 100:
+                    self.window = best
+                    log.info("attached to Viber window: class=%r name=%r score=%d",
+                             best.ClassName, best.Name, best_score)
+                    return
+                # Only weak matches (title only) — log them but keep looking
+                # briefly in case Viber is still launching.
+                log.debug("only weak candidate(s) found; retrying: %s",
+                          [(s, w.Name, w.ClassName) for s, w in candidates[:3]])
             time.sleep(0.5)
-        raise ViberError(f"Could not find Viber window matching {title_sub!r}")
+
+        # Final fallback: accept best weak candidate if we have one
+        if candidates:
+            best_score, best = candidates[0]
+            log.warning("no strong Qt-class match; falling back to weak candidate "
+                        "class=%r name=%r (score=%d). If this is wrong, close the "
+                        "File Explorer window showing the viber-bridge folder, or "
+                        "adjust viber.window_title in config.yaml.",
+                        best.ClassName, best.Name, best_score)
+            self.window = best
+            return
+
+        raise ViberError(
+            f"Could not find the Viber Desktop window. Is Viber running and logged in? "
+            f"Expected a WindowControl with ClassName matching 'MainWindow_QMLTYPE_\\d+'."
+        )
 
     def _ensure_attached(self):
         if self.window is None or not self.window.Exists(0, 0):

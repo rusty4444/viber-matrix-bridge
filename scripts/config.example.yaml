@@ -8,7 +8,11 @@ matrix:
   room_name_prefix: "Viber · "                       # new rooms auto-named "Viber · <contact>"
 
 viber:
-  window_title: "Viber"                              # window title substring (case-insensitive)
+  # Title substring used as a *secondary* match signal. The bridge primarily
+  # identifies Viber by its Qt class name (MainWindow_QMLTYPE_*), so this is
+  # usually not critical. Current Viber Desktop titles its window
+  # "Rakuten Viber" — older/localized builds just say "Viber".
+  window_title: "Rakuten Viber"
   poll_interval_seconds: 3                           # how often to scan for new messages
   backend: "uiautomation"                            # uiautomation | pywinauto (uiautomation recommended)
   typing_delay_ms: 20                                # per-char delay when pasting replies
