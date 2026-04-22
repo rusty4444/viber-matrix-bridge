@@ -123,12 +123,21 @@ MESSAGE_ITEM = Selector(
     fallback="Message bubble (FeedDelegate_QMLTYPE_* — text via ValuePattern)",
 )
 
-# Observed exact class value (for the exact-match native search fallback).
-MESSAGE_ITEM_EXACT_CLASS = "FeedDelegate_QMLTYPE_1077"
+# Stable class-name prefixes. Qt assigns the trailing ``_QMLTYPE_<N>`` or
+# ``_QML_<N>`` numbers in registration order at process start, so they
+# shift across every Viber restart. Selectors that hardcode N stop working
+# after a Viber relaunch. Match by prefix instead (via _native_find_prefix).
+MESSAGE_ITEM_CLASS_PREFIX = "FeedDelegate_QMLTYPE_"
+STACKVIEW_CLASS_PREFIX = "StackView_QMLTYPE_"
+INPUT_BOX_CLASS_PREFIX = "QQuickTextEdit"          # covers bare & _QML_N variants
+SEARCH_BOX_CLASS_PREFIX = "TextFieldItem_QMLTYPE_"
+CONVERSATION_ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_"
 
-# StackView exact class (for native FindFirst-based search).
-STACKVIEW_EXACT_CLASS = "StackView_QMLTYPE_463"
-INPUT_BOX_EXACT_CLASS = "QQuickTextEdit_QML_1021"
+# Deprecated exact constants. Kept as aliases to the prefixes so older
+# callers still work; new code should use the _CLASS_PREFIX names above.
+MESSAGE_ITEM_EXACT_CLASS = MESSAGE_ITEM_CLASS_PREFIX
+STACKVIEW_EXACT_CLASS = STACKVIEW_CLASS_PREFIX
+INPUT_BOX_EXACT_CLASS = INPUT_BOX_CLASS_PREFIX
 
 # Message input box. Viber uses a plain Qt QQuickTextEdit for this — NOT a
 # TextFieldItem (which is the search box) or TextEditItem (which is a

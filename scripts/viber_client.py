@@ -60,6 +60,11 @@ from viber_selectors import (
     MESSAGE_ITEM_EXACT_CLASS,
     STACKVIEW_EXACT_CLASS,
     INPUT_BOX_EXACT_CLASS,
+    MESSAGE_ITEM_CLASS_PREFIX,
+    STACKVIEW_CLASS_PREFIX,
+    INPUT_BOX_CLASS_PREFIX,
+    SEARCH_BOX_CLASS_PREFIX,
+    CONVERSATION_ROW_CLASS_PREFIX,
     INPUT_BOX,
     SEND_BUTTON,
     SCROLL_TO_BOTTOM,
@@ -398,6 +403,51 @@ def _native_find(parent, control_type_name: str, class_name: str,
     return None
 
 
+def _native_find_prefix(parent, control_type_name: str, class_prefix: str,
+                        timeout: float = 5.0, search_depth: int = 20,
+                        scan_limit: int = 30):
+    """Find the first descendant whose ClassName starts with ``class_prefix``.
+
+    Qt/QML assigns ``<Name>_QMLTYPE_<N>`` class names where N is registered
+    at process start and shifts across Viber restarts. A selector pinned to
+    an exact N stops working after every Viber relaunch. This helper
+    searches by ControlType and accepts any class name starting with the
+    stable prefix (e.g. ``TextFieldItem_QMLTYPE_``), which is what we need
+    in practice.
+
+    Polls up to ``timeout`` seconds to let UIA populate the tree; returns
+    the first match or None.
+    """
+    if auto is None:
+        raise ViberError("uiautomation not available on this platform")
+    ctype = getattr(auto, control_type_name, None)
+    if ctype is None:
+        return None
+    deadline = time.monotonic() + max(0.0, timeout)
+    poll = 0.2
+    while True:
+        for i in range(1, scan_limit + 1):
+            try:
+                ctrl = ctype(
+                    searchFromControl=parent,
+                    foundIndex=i,
+                    searchDepth=search_depth,
+                )
+                if not ctrl.Exists(0.0, 0):
+                    break
+                try:
+                    cls = ctrl.ClassName or ""
+                except Exception:
+                    cls = ""
+                if cls.startswith(class_prefix):
+                    return ctrl
+            except Exception:
+                break
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll)
+
+
 def _native_find_all(parent, control_type_name: str, class_name_regex: str,
                     search_depth: int = 20, max_count: int = 50):
     """Find all descendants matching a regex class name.
@@ -651,27 +701,25 @@ class ViberClient:
         Uses UIA's native FindFirst (via uiautomation's ControlType search)
         because our recursive GetChildren() walker returns stale results
         for several seconds after a UI mode change (search <-> chat).
+        Matches by class-name prefix because Qt's QMLTYPE numbers shift
+        across Viber restarts.
         """
-        # Try exact class name first (fast, native UIA path)
-        s = _native_find(self.window, "PaneControl", STACKVIEW_EXACT_CLASS,
-                         timeout=timeout, search_depth=20)
-        if s is not None:
-            return s
-        # Fallback: regex match via GetDescendantControl
-        matches = _native_find_all(self.window, "PaneControl",
-                                    r"StackView_QMLTYPE_\d+", search_depth=20)
-        return matches[0] if matches else None
+        return _native_find_prefix(self.window, "PaneControl",
+                                    STACKVIEW_CLASS_PREFIX,
+                                    timeout=timeout, search_depth=20)
 
     def _search_box(self):
-        """Find the top search box via a SINGLE native FindFirst call.
-        Do NOT use foundIndex iteration — that enumerates all EditControls
-        including message TextEditItems, potentially triggering Qt to
-        render / rebuild them and degrade the accessibility tree.
+        """Find the top search box.
+
+        Matches the TextFieldItem class by prefix because Qt's QMLTYPE
+        numbers shift across Viber restarts (we've seen _QMLTYPE_94 one
+        session and _QMLTYPE_228 the next). The search box is the only
+        TextFieldItem anywhere in Viber's tree, so a prefix match on
+        ``TextFieldItem_QMLTYPE_`` uniquely identifies it.
         """
-        # Exact class name first (fast path)
-        s = _native_find(self.window, "EditControl", "TextFieldItem_QMLTYPE_94",
-                          timeout=1.5, search_depth=10)
-        return s
+        return _native_find_prefix(self.window, "EditControl",
+                                    SEARCH_BOX_CLASS_PREFIX,
+                                    timeout=1.5, search_depth=10)
 
     # ---- Geometry-anchored blind-click fallbacks --------------------
     #
@@ -976,7 +1024,7 @@ class ViberClient:
             # Viber has shipped these rows under multiple QML-type suffixes
             # across versions (ListViewDelegateLoader_QMLTYPE_465_QML_<NNNN>).
             # We match the stable prefix and filter by sidebar geometry.
-            ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
+            ROW_CLASS_PREFIX = CONVERSATION_ROW_CLASS_PREFIX
 
             def _enumerate_search_delegates() -> list[tuple]:
                 """Walk the UIA tree and CAPTURE bounds + name inline for
@@ -1032,39 +1080,10 @@ class ViberClient:
                     except Exception:
                         break
 
-                # Secondary fallback: if the AID-based enumeration produced
-                # nothing, try the old exact-class selectors for both known
-                # suffixes.
-                if not captured:
-                    for suffix in ("_QML_1615", "_QML_1643"):
-                        for i in range(1, 15):
-                            try:
-                                ctrl = auto.GroupControl(
-                                    searchFromControl=self.window,
-                                    ClassName=f"{ROW_CLASS_PREFIX}{suffix}",
-                                    foundIndex=i,
-                                    searchDepth=3,
-                                )
-                                if not ctrl.Exists(0.0, 0):
-                                    break
-                                bounds = _read_bounds_live(ctrl)
-                                if bounds is None:
-                                    continue
-                                try:
-                                    row_name = (ctrl.Name or "").strip()
-                                except Exception:
-                                    row_name = ""
-                                try:
-                                    row_aid = (ctrl.AutomationId or "").strip()
-                                except Exception:
-                                    row_aid = ""
-                                captured.append((ctrl, bounds,
-                                                 f"{ROW_CLASS_PREFIX}{suffix}",
-                                                 row_name, row_aid))
-                            except Exception:
-                                break
-                        if captured:
-                            break
+                # (Historical fallback using hardcoded _QML_<N> suffixes
+                # was removed — the suffix number also shifts across Viber
+                # restarts, and the AID-based scan above with the stable
+                # prefix match is the canonical path now.)
 
                 # Dedup by (left, top) — Qt's UIA bug sometimes returns the
                 # same element many times via different tree paths.
@@ -1249,7 +1268,7 @@ class ViberClient:
             # possibly others on future builds) so we match the stable
             # prefix and filter by sidebar geometry — same pattern as the
             # first-click enumeration above.
-            ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
+            ROW_CLASS_PREFIX = CONVERSATION_ROW_CLASS_PREFIX
             normal_captured: list[tuple] = []
             for i in range(1, 15):
                 try:
@@ -1315,21 +1334,21 @@ class ViberClient:
             # input box. Any of the three is a strong signal the right
             # pane is actually in the UIA tree now.
             def _verify_now() -> bool:
-                stack = _native_find(self.window, "PaneControl",
-                                     STACKVIEW_EXACT_CLASS,
-                                     timeout=1.0, search_depth=20)
+                stack = _native_find_prefix(self.window, "PaneControl",
+                                             STACKVIEW_CLASS_PREFIX,
+                                             timeout=1.0, search_depth=20)
                 if stack is not None:
                     log.info("chat opened (StackView found)")
                     return True
-                feed = _native_find(self.window, "GroupControl",
-                                    MESSAGE_ITEM_EXACT_CLASS,
-                                    timeout=0.5, search_depth=20)
+                feed = _native_find_prefix(self.window, "GroupControl",
+                                            MESSAGE_ITEM_CLASS_PREFIX,
+                                            timeout=0.5, search_depth=20)
                 if feed is not None:
                     log.info("chat opened (FeedDelegate found)")
                     return True
-                inp = _native_find(self.window, "EditControl",
-                                   INPUT_BOX_EXACT_CLASS,
-                                   timeout=0.5, search_depth=20)
+                inp = _native_find_prefix(self.window, "EditControl",
+                                           INPUT_BOX_CLASS_PREFIX,
+                                           timeout=0.5, search_depth=20)
                 if inp is not None:
                     log.info("chat opened (input box found)")
                     return True
@@ -1401,18 +1420,26 @@ class ViberClient:
         # Enumerate FeedDelegate GroupControls via foundIndex loop.
         # Each iteration is a single IUIAutomation::FindFirst call, not a
         # recursive walk, so Qt's tree stays healthy.
+        # Match by class-name prefix because Qt's _QMLTYPE_ number shifts
+        # across Viber restarts.
         items: list = []
-        for i in range(1, limit * 2 + 5):
+        for i in range(1, limit * 4 + 10):
             try:
                 ctrl = auto.GroupControl(
                     searchFromControl=self.window,
-                    ClassName=MESSAGE_ITEM_EXACT_CLASS,
                     foundIndex=i,
                     searchDepth=20,
                 )
                 if not ctrl.Exists(0.0, 0):
                     break
-                items.append(ctrl)
+                try:
+                    cls = ctrl.ClassName or ""
+                except Exception:
+                    cls = ""
+                if cls.startswith(MESSAGE_ITEM_CLASS_PREFIX):
+                    items.append(ctrl)
+                    if len(items) >= limit * 2 + 5:
+                        break
             except Exception:
                 break
 
@@ -1579,7 +1606,7 @@ class ViberClient:
             return False
         time.sleep(0.3)
         # Native-find the input box and send button directly from the window
-        inp = _native_find(self.window, "EditControl", INPUT_BOX_EXACT_CLASS,
+        inp = _native_find_prefix(self.window, "EditControl", INPUT_BOX_CLASS_PREFIX,
                             timeout=2.0, search_depth=20)
         if inp is None:
             log.error("Input box (QQuickTextEdit) not found after opening chat")
@@ -1819,16 +1846,16 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
 
     # --- Step 5: try all three find strategies ---
     print("\n[5] Trying each find strategy:")
-    print(f"    _native_find StackView     : {_native_find(c.window, 'PaneControl', STACKVIEW_EXACT_CLASS, timeout=2.0)}")
-    print(f"    _native_find QQuickTextEdit: {_native_find(c.window, 'EditControl',  INPUT_BOX_EXACT_CLASS,  timeout=2.0)}")
-    print(f"    _native_find FeedDelegate  : {_native_find(c.window, 'GroupControl', MESSAGE_ITEM_EXACT_CLASS,timeout=2.0)}")
+    print(f"    _native_find StackView     : {_native_find_prefix(c.window, 'PaneControl', STACKVIEW_CLASS_PREFIX, timeout=2.0)}")
+    print(f"    _native_find QQuickTextEdit: {_native_find_prefix(c.window, 'EditControl',  INPUT_BOX_CLASS_PREFIX,  timeout=2.0)}")
+    print(f"    _native_find FeedDelegate  : {_native_find_prefix(c.window, 'GroupControl', MESSAGE_ITEM_CLASS_PREFIX,timeout=2.0)}")
     native_all = _native_find_all(c.window, "GroupControl", r"FeedDelegate_QMLTYPE_\d+", search_depth=20)
     print(f"    _native_find_all FeedDel   : {len(native_all)} results")
     our_find = _find(c.window, CHAT_STACK, timeout=2.0)
     print(f"    _find (GetChildren) StackView: {our_find}")
 
     # --- Step 6: if StackView found, dump its content ---
-    stack = _native_find(c.window, "PaneControl", STACKVIEW_EXACT_CLASS, timeout=1.0) \
+    stack = _native_find_prefix(c.window, "PaneControl", STACKVIEW_CLASS_PREFIX, timeout=1.0) \
             or _find(c.window, CHAT_STACK, timeout=1.0)
     if stack:
         print(f"\n[6] StackView found! Dumping content with pattern values:")
@@ -1850,12 +1877,12 @@ def _inspect_active_main():
     print("Testing native FindFirst finds (no GetChildren tree-walking):")
     print()
 
-    stack = _native_find(c.window, "PaneControl", STACKVIEW_EXACT_CLASS, timeout=3.0, search_depth=20)
-    print(f"  StackView_QMLTYPE_463 :  {stack}")
-    feed  = _native_find(c.window, "GroupControl", MESSAGE_ITEM_EXACT_CLASS, timeout=3.0, search_depth=20)
-    print(f"  FeedDelegate_QMLTYPE  :  {feed}")
-    inp   = _native_find(c.window, "EditControl",  INPUT_BOX_EXACT_CLASS,   timeout=3.0, search_depth=20)
-    print(f"  QQuickTextEdit        :  {inp}")
+    stack = _native_find_prefix(c.window, "PaneControl", STACKVIEW_CLASS_PREFIX, timeout=3.0, search_depth=20)
+    print(f"  StackView_QMLTYPE_*   :  {stack}")
+    feed  = _native_find_prefix(c.window, "GroupControl", MESSAGE_ITEM_CLASS_PREFIX, timeout=3.0, search_depth=20)
+    print(f"  FeedDelegate_QMLTYPE_*:  {feed}")
+    inp   = _native_find_prefix(c.window, "EditControl",  INPUT_BOX_CLASS_PREFIX,   timeout=3.0, search_depth=20)
+    print(f"  QQuickTextEdit*       :  {inp}")
     send  = _native_find(c.window, "ButtonControl", "SendToolbarButton",     timeout=3.0, search_depth=20)
     print(f"  SendToolbarButton     :  {send}")
 
