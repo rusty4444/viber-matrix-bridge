@@ -164,6 +164,27 @@ def _is_visible(el) -> bool:
     return _visible_bounds(el) is not None
 
 
+def _dedup_by_position(controls):
+    """Qt's UIA implementation exposes QQuickControl's children recursively
+    across many nesting levels (a known Qt bug). ``_find_all(recursive=True)``
+    therefore returns the same element 5-10+ times. Dedup by screen position.
+    """
+    seen = set()
+    out = []
+    for c in controls:
+        try:
+            r = c.BoundingRectangle
+            key = (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            out.append(c)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
 def _read_text(el) -> str:
     """Extract text content from a UIA element.
 
@@ -435,42 +456,51 @@ class ViberClient:
                 log.error("ApplicationWindowContentControl not found after search")
                 return False
 
-            all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=4)
+            all_rows = _find_all(app, CONVERSATION_ROW, recursive=True, max_depth=12)
             visible_rows = [r for r in all_rows if _is_visible(r)]
-            log.info("after search %r: %d delegate(s) total, %d visible",
+            # De-duplicate: Qt UIA exposes each row at every nesting level of
+            # QQuickControl, so we get N rows * depth duplicates.
+            visible_rows = _dedup_by_position(visible_rows)
+            # Sort topmost-first so the best search match is row[0].
+            visible_rows.sort(key=lambda r: r.BoundingRectangle.top)
+            log.info("after search %r: %d delegate(s) total, %d unique visible",
                      name, len(all_rows), len(visible_rows))
 
             if not visible_rows:
-                # Log the bounds of every phantom delegate for debugging
-                for i, r in enumerate(all_rows):
-                    try:
-                        rect = r.BoundingRectangle
-                        log.debug("  row[%d] bounds=%s class=%r",
-                                  i, rect, r.ClassName)
-                    except Exception:
-                        pass
                 log.error("No VISIBLE conversation rows after search %r. "
                           "Viber may be minimised, not focused, or the contact "
                           "name didn't match anything.", name)
                 return False
 
-            # Click the first visible row (top match)
+            # Click the topmost visible row. IMPORTANT: we cannot use the
+            # UIA control's default center click — Qt reports each row's
+            # height as the full viewport-remaining height (e.g. 870px), so
+            # "center" lands several rows below the actual item. Click near
+            # the top-left of the reported bounds instead.
             target = visible_rows[0]
-            bounds = _visible_bounds(target)
-            log.info("clicking visible row at bounds=%s", bounds)
+            r = target.BoundingRectangle
+            # (left + 50, top + 30) reliably hits the avatar / name area of
+            # a Viber list row.
+            click_x = r.left + 50
+            click_y = r.top + 30
+            log.info("clicking search result at screen (%d,%d) "
+                     "[row reports bounds=(%d,%d,%d,%d)]",
+                     click_x, click_y, r.left, r.top, r.right, r.bottom)
             try:
-                target.Click(simulateMove=False)
+                auto.Click(click_x, click_y, waitTime=0.1)
             except Exception as e:
-                log.error("Click on visible row failed: %s", e)
+                log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
             # Give Viber time to swap in the chat
-            time.sleep(self.cfg.get("click_pause_ms", 400) / 1000.0)
+            time.sleep(max(self.cfg.get("click_pause_ms", 500), 500) / 1000.0)
 
             # Verify a StackView (active chat pane) is now present
             stack = self._chat_stack()
             if stack is None:
-                log.error("StackView not found after click — chat didn't open")
+                log.error("StackView not found after click — chat didn't open. "
+                          "(If Viber shows a Channel instead of a chat, the "
+                          "top search result was a Channel, not a Conversation.)")
                 return False
 
             # Only NOW clear the search, once we know we're in the chat
