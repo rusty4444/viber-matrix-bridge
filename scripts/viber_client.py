@@ -1308,4 +1308,4 @@ if __name__ == "__main__":
         print("Examples:")
         print("  python viber_client.py --inspect 10")
         print("  python viber_client.py --inspect-subtree StackView")
-        print("  python viber_client.py --inspect-chat Candy")
+        print("  python viber_client.py --inspect-chat <contact-name>")
