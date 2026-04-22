@@ -14,6 +14,8 @@ Public API:
 """
 
 from __future__ import annotations
+import ctypes
+import ctypes.wintypes
 import logging
 import re
 import sys
@@ -27,6 +29,24 @@ try:
     import uiautomation as auto
 except ImportError:
     auto = None
+
+# UIA property IDs (from UIAutomationClient.h).
+# https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-automation-element-propids
+UIA_BoundingRectanglePropertyId = 30001
+UIA_IsOffscreenPropertyId = 30022
+
+
+class _UIA_RECT(ctypes.Structure):
+    """tagRECT as returned by IUIAutomationElement::get_CurrentBoundingRectangle.
+
+    UIA uses (left, top, right, bottom) in physical screen pixels (not DIPs).
+    """
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
 
 from viber_selectors import (
     MAIN_WINDOW,
@@ -146,21 +166,167 @@ def _collect(parent, selector, results, recursive: bool, max_depth: int, depth: 
             _collect(c, selector, results, recursive=True, max_depth=max_depth, depth=depth + 1)
 
 
+def _rect_from_variant(v) -> tuple[int, int, int, int] | None:
+    """GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId) returns a
+    VARIANT holding a SAFEARRAY of 4 doubles: [left, top, width, height].
+    comtypes usually unwraps it to a tuple/list."""
+    if v is None:
+        return None
+    try:
+        arr = list(v)
+    except Exception:
+        return None
+    if len(arr) != 4:
+        return None
+    try:
+        l = int(round(arr[0])); t = int(round(arr[1]))
+        w = int(round(arr[2])); h = int(round(arr[3]))
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (l, t, l + w, t + h)
+
+
+def _bounds_via_com(el) -> tuple[int, int, int, int] | None:
+    """Try three direct COM paths on the raw IUIAutomationElement.
+
+    Python-UIAutomation-for-Windows (``uiautomation`` package) exposes the
+    underlying COM object as ``Control.Element`` (sometimes ``_element`` on
+    older versions). This bypasses the library's wrapper, which is where the
+    (0,0,0,0) / None bug lives.
+
+    Paths tried, in order:
+      A. ``element.CurrentBoundingRectangle`` — comtypes-generated property
+         that wraps ``get_CurrentBoundingRectangle``. Returns a tagRECT.
+      B. ``element.GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId)``
+         — returns a VARIANT holding [left, top, width, height] doubles.
+      C. Raw vtable call to ``get_CurrentBoundingRectangle`` via ctypes.
+    """
+    raw = getattr(el, "Element", None) or getattr(el, "_element", None)
+    if raw is None:
+        return None
+
+    # Path A: comtypes-wrapped property
+    try:
+        rect = raw.CurrentBoundingRectangle
+        if rect is not None:
+            l = int(rect.left); t = int(rect.top)
+            r = int(rect.right); b = int(rect.bottom)
+            if r - l > 0 and b - t > 0:
+                return (l, t, r, b)
+    except Exception:
+        pass
+
+    # Path B: GetCurrentPropertyValue -> VARIANT (SAFEARRAY of 4 doubles)
+    try:
+        v = raw.GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId)
+        got = _rect_from_variant(v)
+        if got is not None:
+            return got
+    except Exception:
+        pass
+
+    # Path C: raw vtable call via ctypes.
+    # IUIAutomationElement methods are declared in UIAutomationClient.h; the
+    # layout we need is: [0]=QueryInterface [1]=AddRef [2]=Release ...
+    # get_CurrentBoundingRectangle is reliably the 9th method on the v-table
+    # for IUIAutomationElement (index 8 zero-based). We locate it via the
+    # Python attribute that comtypes resolves for us, so we don't have to
+    # hard-code the slot.
+    try:
+        # comtypes exposes each method as a bound callable on the proxy.
+        fn = getattr(raw, "_get_CurrentBoundingRectangle", None)
+        if fn is not None:
+            rect = _UIA_RECT()
+            hr = fn(ctypes.byref(rect))
+            if hr == 0 and (rect.right - rect.left) > 0 and (rect.bottom - rect.top) > 0:
+                return (int(rect.left), int(rect.top),
+                        int(rect.right), int(rect.bottom))
+    except Exception:
+        pass
+
+    return None
+
+
+def _debug_bounds_all(el) -> str:
+    """Diagnostic: try every bounds-reading path and return a short string
+    summarising which ones worked. Only used by --inspect-chat fallbacks."""
+    parts = []
+    # Wrapped property.
+    try:
+        r = el.BoundingRectangle
+        if r is None:
+            parts.append("wrap=None")
+        else:
+            w = r.right - r.left; h = r.bottom - r.top
+            parts.append(f"wrap=({r.left},{r.top},{r.right},{r.bottom},{w}x{h})")
+    except Exception as e:
+        parts.append(f"wrap!={type(e).__name__}")
+
+    raw = getattr(el, "Element", None) or getattr(el, "_element", None)
+    if raw is None:
+        parts.append("raw=None")
+        return " | ".join(parts)
+
+    # Path A
+    try:
+        rr = raw.CurrentBoundingRectangle
+        parts.append(f"A=({rr.left},{rr.top},{rr.right},{rr.bottom})")
+    except Exception as e:
+        parts.append(f"A!={type(e).__name__}:{e}")
+    # Path B
+    try:
+        v = raw.GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId)
+        try:
+            as_list = list(v) if v is not None else None
+        except Exception:
+            as_list = repr(v)[:60]
+        parts.append(f"B={as_list}")
+    except Exception as e:
+        parts.append(f"B!={type(e).__name__}:{e}")
+    # Path C (raw vtable)
+    try:
+        fn = getattr(raw, "_get_CurrentBoundingRectangle", None)
+        if fn is None:
+            parts.append("C=no-attr")
+        else:
+            rect = _UIA_RECT()
+            hr = fn(ctypes.byref(rect))
+            parts.append(f"C(hr={hr:#x})=({rect.left},{rect.top},{rect.right},{rect.bottom})")
+    except Exception as e:
+        parts.append(f"C!={type(e).__name__}:{e}")
+    # Offscreen hint
+    try:
+        off = raw.GetCurrentPropertyValue(UIA_IsOffscreenPropertyId)
+        parts.append(f"off={off}")
+    except Exception:
+        pass
+    return " | ".join(parts)
+
+
 def _read_bounds_live(el, retries: int = 2, settle: float = 0.05) -> tuple[int, int, int, int] | None:
     """Read BoundingRectangle, working around the known uiautomation quirk
-    where freshly-found proxies return (0,0,0,0) until their internal cache
-    is populated. See
-    https://github.com/yinkaisheng/Python-UIAutomation-for-Windows/issues/212
+    where freshly-found proxies return (0,0,0,0) or None from the wrapped
+    .BoundingRectangle property even though the underlying UIA element has
+    a valid rect.
 
-    Strategy:
-      1. Read BoundingRectangle. If non-zero, return.
-      2. Call .Refind() to force the library to re-resolve the UIA element
-         from its stored condition. Re-read BoundingRectangle.
-      3. Retry a few times with a small sleep between attempts.
+    See https://github.com/yinkaisheng/Python-UIAutomation-for-Windows/issues/212
 
-    Returns (left, top, right, bottom) or None.
+    Strategy (each attempt, short-circuits on first success):
+      1. Library property: ``el.BoundingRectangle`` (fast path).
+      2. Direct COM on ``el.Element``:
+           a. ``CurrentBoundingRectangle`` (comtypes property)
+           b. ``GetCurrentPropertyValue(30001)`` (VARIANT)
+           c. ``_get_CurrentBoundingRectangle`` raw vtable call
+      3. ``el.Refind()`` to force the library to re-resolve the UIA element
+         from its stored condition, then loop.
+      4. Small sleep + retry.
+
+    Returns (left, top, right, bottom) in physical screen pixels, or None.
     """
     for attempt in range(retries + 1):
+        # 1. Wrapped property (normally works).
         try:
             r = el.BoundingRectangle
             if r is not None:
@@ -169,13 +335,20 @@ def _read_bounds_live(el, retries: int = 2, settle: float = 0.05) -> tuple[int, 
                     return (l, t, rt, b)
         except Exception:
             pass
-        # Stale or uninitialized proxy — force refresh.
+
+        # 2. Direct COM fallback — the important one.
+        got = _bounds_via_com(el)
+        if got is not None:
+            return got
+
+        # 3. Refind and loop.
         try:
             el.Refind()
         except Exception:
             pass
         if attempt < retries:
             time.sleep(settle)
+
     return None
 
 
@@ -1248,8 +1421,21 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
         print(f"      row[{idx}] name={nm!r:20s} bounds=({bn[0]},{bn[1]},{bn[2]},{bn[3]}) cls={cls!r}")
     if not unique:
         print("    No visible rows found. Falling back to sidebar-scan diagnostic:")
+        # Show per-path diagnostic on the first few RAW rows so we can see
+        # which COM path (wrapped / A / B / C) is actually working, if any.
+        print("    Per-path diagnostic for first raw rows:")
+        for i, rr in enumerate(all_rows[:6]):
+            try:
+                dbg = _debug_bounds_all(rr)
+                cls = (rr.ClassName or "")
+                nm = (rr.Name or "").strip()
+                print(f"      raw[{i}] name={nm!r:20s} cls={cls!r}")
+                print(f"        {dbg}")
+            except Exception as e:
+                print(f"      raw[{i}] debug error: {e}")
         # Last-ditch: enumerate delegateLoader GroupControls anywhere in
         # the window, print everything, so we can see what's actually there.
+        print("    Sidebar delegateLoader scan:")
         for i in range(1, 40):
             try:
                 ctrl = auto.GroupControl(
@@ -1265,6 +1451,10 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
                 bs = f"({bn[0]},{bn[1]},{bn[2]},{bn[3]})" if bn else "no-rect"
                 nm = (ctrl.Name or "").strip()
                 print(f"      [{i}] name={nm!r:20s} bounds={bs} cls={cls!r}")
+                if bn is None:
+                    # Dump per-path diagnostic on the first row that still
+                    # has no rect — this is the row we actually need to click.
+                    print(f"        {_debug_bounds_all(ctrl)}")
             except Exception as e:
                 print(f"      [{i}] error: {e}")
                 break
