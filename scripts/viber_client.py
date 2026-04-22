@@ -492,16 +492,49 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Give Viber time to swap in the chat
-            time.sleep(max(self.cfg.get("click_pause_ms", 500), 500) / 1000.0)
+            # Give Viber time to swap search UI out and paint the chat.
+            # Qt's UIA tree can lag the visible UI by a second or two after a
+            # mode change (search -> chat), so we retry patiently.
+            post_click_wait = max(self.cfg.get("click_pause_ms", 1000), 1000) / 1000.0
+            time.sleep(post_click_wait)
 
-            # Verify a StackView (active chat pane) is now present
-            stack = self._chat_stack()
-            if stack is None:
-                log.error("StackView not found after click — chat didn't open. "
-                          "(If Viber shows a Channel instead of a chat, the "
-                          "top search result was a Channel, not a Conversation.)")
+            # Re-attach the window handle in case the click caused Viber to
+            # rebuild its top-level UIA object.
+            try:
+                self.window = None
+                self.attach()
+            except ViberError:
+                pass
+
+            # Look for ANY of: the active-chat StackView, OR the message input
+            # box (QQuickTextEdit), OR a send button. Any of these = chat is
+            # actually open. Retry over ~5s since the tree can settle slowly.
+            stack = None
+            input_box = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                stack = self._chat_stack()
+                if stack is not None:
+                    input_box = _find(stack, INPUT_BOX, timeout=0.2)
+                    if input_box is not None:
+                        break
+                # Fallback: maybe StackView selector mismatches post-click; any
+                # QQuickTextEdit in the window is a good sign.
+                input_box = _find(self.window, INPUT_BOX, timeout=0.2)
+                if input_box is not None and _is_visible(input_box):
+                    break
+                time.sleep(0.3)
+
+            if stack is None and (input_box is None or not _is_visible(input_box)):
+                log.error(
+                    "Chat didn't open within 5s. Neither StackView nor a "
+                    "visible message input was found. If Viber's right pane "
+                    "shows a Channel viewer or 'info' panel, the top search "
+                    "result wasn't a real Conversation."
+                )
                 return False
+            log.info("chat opened successfully (stack=%s, input=%s)",
+                     bool(stack), bool(input_box))
 
             # Only NOW clear the search, once we know we're in the chat
             try:
