@@ -673,6 +673,85 @@ class ViberClient:
                           timeout=1.5, search_depth=10)
         return s
 
+    # ---- Geometry-anchored blind-click fallbacks --------------------
+    #
+    # Qt/QML's IAccessible implementation intermittently reports
+    # zero-rect BoundingRectangle for every sidebar ListView delegate
+    # even though the rows are rendered and clickable on screen. In
+    # that state we can't enumerate rows via UIA — but we can still
+    # click them, because the search box itself stays live and gives
+    # us a reliable anchor.
+    #
+    # Calibration source: a successful --inspect-chat run where both
+    # the search box and the search-result rows reported real bounds:
+    #   search box top           = 195
+    #   first search-result top  = 339   → offset +144 below search box
+    #   first normal-list top    = 276   → offset  +81 below search box
+    #   row height               ≈ 72 px
+    #
+    # These offsets are pixel-exact at the standard Windows DPI (100%)
+    # Viber uses by default. If Viber's UI is zoomed they'll drift; we
+    # log the computed click point so it can be recalibrated from a
+    # field log without another inspect run.
+    _SIDEBAR_SEARCH_RESULT_Y_OFFSET = 144
+    _SIDEBAR_NORMAL_ROW_Y_OFFSET = 81
+    _SIDEBAR_ROW_CENTER_Y_OFFSET = 36   # ~half a 72 px row
+
+    def _blind_click_top_search_result(self, sb) -> bool:
+        """Click the topmost search-result slot relative to the search
+        box's live bounds. Used when UIA enumeration returns 0 rows.
+
+        Returns True if the click was issued, False if we couldn't even
+        read the anchor bounds.
+        """
+        bnds = _read_bounds_live(sb)
+        if bnds is None:
+            log.error("blind-click: search box has no bounds; cannot anchor")
+            return False
+        sb_l, sb_t, sb_r, _sb_b = bnds
+        # 10 px inside the sidebar column (sidebar's left edge aligns
+        # with or slightly left of the search box); vertical center of
+        # the first result row.
+        cx = sb_l + 10
+        cy = (sb_t
+              + self._SIDEBAR_SEARCH_RESULT_Y_OFFSET
+              + self._SIDEBAR_ROW_CENTER_Y_OFFSET)
+        log.warning("UIA enumeration dead — blind-clicking top search "
+                    "result at (%d,%d), anchored to search box "
+                    "bounds=(%d,%d,%d,%d)",
+                    cx, cy, sb_l, sb_t, sb_r, bnds[3])
+        try:
+            auto.Click(cx, cy, waitTime=0.1)
+            return True
+        except Exception as e:
+            log.error("blind-click at (%d,%d) failed: %s", cx, cy, e)
+            return False
+
+    def _blind_click_top_normal_row(self, sb) -> bool:
+        """Click the topmost normal-list sidebar row relative to the
+        search box's live bounds. Used after clearing search when UIA
+        enumeration of the normal list returns 0 rows.
+        """
+        bnds = _read_bounds_live(sb)
+        if bnds is None:
+            log.error("blind-click: search box has no bounds; cannot anchor")
+            return False
+        sb_l, sb_t, sb_r, _sb_b = bnds
+        cx = sb_l + 10
+        cy = (sb_t
+              + self._SIDEBAR_NORMAL_ROW_Y_OFFSET
+              + self._SIDEBAR_ROW_CENTER_Y_OFFSET)
+        log.warning("UIA normal-list dead — blind-clicking top normal "
+                    "row at (%d,%d), anchored to search box "
+                    "bounds=(%d,%d,%d,%d)",
+                    cx, cy, sb_l, sb_t, sb_r, bnds[3])
+        try:
+            auto.Click(cx, cy, waitTime=0.1)
+            return True
+        except Exception as e:
+            log.error("blind-click at (%d,%d) failed: %s", cx, cy, e)
+            return False
+
     # ---- Conversation navigation ------------------------------------
     def list_conversations(self) -> list[ViberConversation]:
         """Return the visible conversation rows.
@@ -1050,25 +1129,46 @@ class ViberClient:
             log.info("after search %r: %d unique delegate(s)",
                      name, len(unique))
 
+            # Track whether we fell through to the blind-click path.
+            # Downstream code expects `bnds` to be set (used in logging
+            # after the click); we provide a synthetic value if blind.
+            blind_first_click = False
             if not unique:
-                log.error("No search-result rows matched after search %r "
-                          "(tried %d enumeration attempts). Viber may be "
-                          "minimised, not focused, or the contact name "
-                          "didn't match anything. Tried AID=delegateLoader "
-                          "with class prefix %r and geometry "
-                          "200–400px x 40–200px.",
-                          name, ENUM_RETRIES, ROW_CLASS_PREFIX)
-                return False
+                # Qt's accessibility tree is in the zero-rect state:
+                # rows are rendered on screen but UIA reports no bounds
+                # for any of them. Fall back to a geometry-anchored
+                # click relative to the search box (which stays live
+                # even when the list doesn't).
+                log.warning("No search-result rows visible via UIA after "
+                            "search %r (tried %d enumeration attempts). "
+                            "Attempting blind-click fallback.",
+                            name, ENUM_RETRIES)
+                if not self._blind_click_top_search_result(search):
+                    log.error("Blind-click fallback also failed for %r. "
+                              "Search box may be gone or Viber not "
+                              "clickable.", name)
+                    return False
+                blind_first_click = True
+                # Synthesize a bnds tuple for the downstream log line.
+                # Use the anchor rect so operators can see which slot
+                # we actually targeted.
+                _sb_bnds = _read_bounds_live(search) or (0, 0, 0, 0)
+                bnds = (_sb_bnds[0],
+                        _sb_bnds[1] + self._SIDEBAR_SEARCH_RESULT_Y_OFFSET,
+                        _sb_bnds[2],
+                        _sb_bnds[1] + self._SIDEBAR_SEARCH_RESULT_Y_OFFSET + 72)
 
             # Log every captured row's cached properties for diagnostics.
             # Viber groups search results into sections (Conversations,
             # Contacts, Channels); we prefer the Conversations row whose
             # Name matches the query.
-            for idx, (ctrl, bnds, cls, row_name, row_aid) in enumerate(unique):
-                log.info("  row[%d] name=%r aid=%r bounds=(%d,%d,%d,%d) h=%d cls=%r",
-                         idx, row_name[:40], row_aid[:30],
-                         bnds[0], bnds[1], bnds[2], bnds[3], bnds[3] - bnds[1],
-                         cls[:50])
+            # (Skipped if we already fell through to blind-click.)
+            if not blind_first_click:
+                for idx, (ctrl, bnds, cls, row_name, row_aid) in enumerate(unique):
+                    log.info("  row[%d] name=%r aid=%r bounds=(%d,%d,%d,%d) h=%d cls=%r",
+                             idx, row_name[:40], row_aid[:30],
+                             bnds[0], bnds[1], bnds[2], bnds[3], bnds[3] - bnds[1],
+                             cls[:50])
 
             # Pick strategy, best-first (all operate on cached row_name):
             #   1. Exact case-insensitive Name match
@@ -1077,46 +1177,44 @@ class ViberClient:
             #   4. All query-words present (any order) — handles multi-word
             #      contacts where Viber adds a suffix to the display name
             #   5. Topmost row (no name match)
-            query_lc = name.strip().lower()
-            query_words = [w for w in query_lc.split() if w]
-            target_tup = None
-            pick_reason = ""
-            for pred, label in [
-                (lambda n: n.lower() == query_lc, "exact-name match"),
-                (lambda n: n.lower().startswith(query_lc), "name-prefix match"),
-                (lambda n: query_lc in n.lower(), "name-substring match"),
-                (lambda n: all(w in n.lower() for w in query_words) if query_words else False,
-                 "all-words-present match"),
-            ]:
-                matches = [t for t in unique if pred(t[3])]
-                if matches:
-                    matches.sort(key=lambda t: t[1][1])
-                    target_tup = matches[0]
-                    pick_reason = label
-                    break
-            if target_tup is None:
-                target_tup = unique[0]  # already sorted by top
-                pick_reason = "topmost row (no name match)"
+            # (Skipped if we already fell through to blind-click.)
+            if not blind_first_click:
+                query_lc = name.strip().lower()
+                query_words = [w for w in query_lc.split() if w]
+                target_tup = None
+                pick_reason = ""
+                for pred, label in [
+                    (lambda n: n.lower() == query_lc, "exact-name match"),
+                    (lambda n: n.lower().startswith(query_lc), "name-prefix match"),
+                    (lambda n: query_lc in n.lower(), "name-substring match"),
+                    (lambda n: all(w in n.lower() for w in query_words) if query_words else False,
+                     "all-words-present match"),
+                ]:
+                    matches = [t for t in unique if pred(t[3])]
+                    if matches:
+                        matches.sort(key=lambda t: t[1][1])
+                        target_tup = matches[0]
+                        pick_reason = label
+                        break
+                if target_tup is None:
+                    target_tup = unique[0]  # already sorted by top
+                    pick_reason = "topmost row (no name match)"
 
-            # Use the CACHED bounds for click coordinates, not a re-query.
-            target, bnds, _cls, _nm, _aid = target_tup
-            cl_left, cl_top, cl_right, cl_bottom = bnds
-            click_x = cl_left + 50
-            click_y = cl_top + min(30, max(10, (cl_bottom - cl_top) // 3))
-            r = type("_R", (), {"left": cl_left, "top": cl_top,
-                                "right": cl_right, "bottom": cl_bottom})()
-            # Alias for the diagnostic log line below.
-            def _row_name(c):
-                return _nm
-            log.info("clicking search result at screen (%d,%d) [picked=%r "
-                     "reason=%s bounds=(%d,%d,%d,%d) h=%d]",
-                     click_x, click_y, _row_name(target)[:40], pick_reason,
-                     r.left, r.top, r.right, r.bottom, r.bottom - r.top)
-            try:
-                auto.Click(click_x, click_y, waitTime=0.1)
-            except Exception as e:
-                log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
-                return False
+                # Use the CACHED bounds for click coordinates, not a re-query.
+                target, bnds, _cls, _nm, _aid = target_tup
+                cl_left, cl_top, cl_right, cl_bottom = bnds
+                click_x = cl_left + 50
+                click_y = cl_top + min(30, max(10, (cl_bottom - cl_top) // 3))
+                log.info("clicking search result at screen (%d,%d) "
+                         "[picked=%r reason=%s bounds=(%d,%d,%d,%d) h=%d]",
+                         click_x, click_y, _nm[:40], pick_reason,
+                         cl_left, cl_top, cl_right, cl_bottom,
+                         cl_bottom - cl_top)
+                try:
+                    auto.Click(click_x, click_y, waitTime=0.1)
+                except Exception as e:
+                    log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
+                    return False
 
             # Chat is visually open on the right, but Viber is now in
             # hybrid 'search+chat' mode: the StackView and FeedDelegate
@@ -1200,8 +1298,15 @@ class ViberClient:
                 except Exception as e:
                     log.debug("normal-list re-click failed: %s", e)
             else:
-                log.warning("no normal-list rows visible after clearing search; "
-                            "cannot re-click to enter normal mode")
+                # UIA can't see normal-list rows either. Blind-click
+                # the top normal-row slot anchored to the search box.
+                # The chat we just opened has bubbled to the top of
+                # the recency-sorted list, so the topmost slot is
+                # always the correct target.
+                log.warning("no normal-list rows visible via UIA after "
+                            "clearing search; attempting blind-click "
+                            "fallback")
+                self._blind_click_top_normal_row(search)
 
             # Give Viber time to transition and expose the StackView.
             time.sleep(1.5)
