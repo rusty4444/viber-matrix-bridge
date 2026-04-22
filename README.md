@@ -80,6 +80,14 @@ In Element (as `@sam.russell:samprim.net`):
 3. Copy the room ID (Room Settings → Advanced → Internal room ID, looks like `!abc123:samprim.net`)
 4. Paste into `config.yaml` as `matrix.control_room_id`
 
+**Then accept the invite on the bridge user's behalf** — the @viber account has no UI, so you do it with a single API call. Use the helper:
+
+```bash
+bash matrix-setup/accept-invite.sh '!abc123:samprim.net' 'syt_dmliZXI_xxx...'
+```
+
+(You'll run this again for any future room you invite `@viber` into manually.)
+
 ### 3. Install Viber Desktop on the Windows Media Server
 
 - Download from [viber.com](https://www.viber.com/en/download/) and sign in with your phone number
