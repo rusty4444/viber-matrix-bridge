@@ -200,7 +200,9 @@ class Bridge:
                 "  !status — bridge & Viber status\n"
                 "  !list — mapped Viber chats\n"
                 "  !scan — count of visible Viber conversation rows (names not readable)\n"
-                "  !addchat <viber name> — create a Matrix room for this Viber chat\n"
+                "  !readhere — read messages from the chat currently open in Viber\n"
+                "  !pairhere <viber name> — create a Matrix room paired to the chat currently open in Viber (most reliable)\n"
+                "  !addchat <viber name> — search + navigate + create a Matrix room (may fail, UIA limitations)\n"
                 "  !pair <!room_id> <viber name> — manually pair an existing room\n"
                 "  !unpair <viber name> — remove pairing\n"
                 "  !test <viber name> — try navigating to a chat and reading messages\n"
@@ -243,6 +245,32 @@ class Bridge:
             room_id = await self.matrix.create_bridge_room(vname)
             await self.state.set_mapping(vname, room_id)
             return f"created & paired: {vname!r} → {room_id}"
+        if cmd == "pairhere":
+            if not args:
+                return "usage: !pairhere <viber contact or group name>"
+            vname = " ".join(args)
+            existing = await self.state.get_room_for_viber(vname)
+            if existing:
+                return f"already paired: {vname!r} → {existing}"
+            # Don't navigate — just check if a chat is currently open
+            msgs = self.viber.read_current_chat_messages(limit=3, conversation_label=vname)
+            if not msgs:
+                return ("no chat appears to be currently open in Viber. "
+                        "Click the chat you want to pair, then run this again.")
+            room_id = await self.matrix.create_bridge_room(vname)
+            await self.state.set_mapping(vname, room_id)
+            preview = "\n  ".join(f"← {m.text[:60]}" for m in msgs[-3:])
+            return (f"paired currently-open Viber chat as {vname!r} → {room_id}\n"
+                    f"Last messages seen:\n  {preview}")
+        if cmd == "readhere":
+            msgs = self.viber.read_current_chat_messages(limit=10)
+            if not msgs:
+                return "no chat open in Viber, or messages not accessible"
+            lines = [f"{len(msgs)} message(s) in the currently-open chat:"]
+            for m in msgs[-10:]:
+                d = "→" if m.outgoing else "←"
+                lines.append(f"  {d} {m.text[:80]}")
+            return "\n".join(lines)
         if cmd == "test":
             if not args:
                 return "usage: !test <viber contact or group name>"

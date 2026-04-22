@@ -617,14 +617,16 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Click registered — chat is now open on the right, but Viber
-            # is in hybrid "search+chat" mode where the StackView is NOT
-            # exposed to UIA. To get the StackView into the tree, we need
-            # to put Viber in true "normal chat mode" by clicking the chat
-            # from the normal conversation list (not search results).
+            # Chat is visually open on the right, but Viber is in hybrid
+            # 'search+chat' mode: the StackView is NOT in the UIA tree.
+            # Strategy: click inside the RIGHT PANE AREA (not on any
+            # control, just within the chat panel bounds) to give that
+            # side focus. This may transition Viber to normal chat mode
+            # and expose the StackView. We calculate coordinates window-
+            # relative so they work regardless of where Viber is on screen.
             time.sleep(0.5)
 
-            # Clear search with keyboard only (no UIA clicks to preserve tree)
+            # First, clear search with keyboard only (no UIA clicks).
             try:
                 auto.SendKeys("{Esc}", waitTime=0.15)
                 auto.SendKeys("{Ctrl}a", waitTime=0.05)
@@ -633,41 +635,24 @@ class ViberClient:
             except Exception as e:
                 log.debug("clearing search: %s", e)
 
-            # Wait for the normal conversation list to redraw.
-            time.sleep(1.0)
+            time.sleep(0.5)
 
-            # Find the topmost visible _1615 (normal list) delegate — since
-            # we just opened this chat, it will have bubbled to the top of
-            # the conversation list. Clicking it re-opens the same chat in
-            # "normal chat mode" which DOES populate the StackView.
+            # Click in the right pane area. Viber's layout is roughly:
+            #   left 28% = conversation sidebar
+            #   right 72% = active chat pane
+            # Click at ~65% across, ~50% down to hit the message area.
             try:
-                normal_rows = []
-                for i in range(1, 8):
-                    ctrl = auto.GroupControl(
-                        searchFromControl=self.window,
-                        ClassName="ListViewDelegateLoader_QMLTYPE_465_QML_1615",
-                        foundIndex=i,
-                        searchDepth=3,
-                    )
-                    if not ctrl.Exists(0.0, 0):
-                        break
-                    normal_rows.append(ctrl)
-                normal_rows = [r for r in normal_rows if _is_visible(r)]
-                normal_rows = _dedup_by_position(normal_rows)
-                normal_rows.sort(key=lambda r: r.BoundingRectangle.top)
-                if normal_rows:
-                    top = normal_rows[0]
-                    rr = top.BoundingRectangle
-                    auto.Click(rr.left + 50, rr.top + 30, waitTime=0.1)
-                    log.info("re-clicked topmost normal-list row at (%d,%d) "
-                             "to enter normal chat mode",
-                             rr.left + 50, rr.top + 30)
-                else:
-                    log.warning("no normal-list rows visible; cannot re-click")
+                wb = self.window.BoundingRectangle
+                if wb is not None and (wb.right - wb.left) > 0:
+                    cx = wb.left + int((wb.right - wb.left) * 0.65)
+                    cy = wb.top  + int((wb.bottom - wb.top) * 0.50)
+                    log.info("clicking right-pane area at (%d,%d) to exit hybrid mode",
+                             cx, cy)
+                    auto.Click(cx, cy, waitTime=0.1)
             except Exception as e:
-                log.debug("normal-list re-click failed: %s", e)
+                log.debug("right-pane click: %s", e)
 
-            # Give Viber time to enter normal mode and expose the StackView.
+            # Give Viber time to transition and update the UIA tree.
             time.sleep(1.5)
 
             # Single FindFirst for the chat pane.
@@ -675,7 +660,7 @@ class ViberClient:
                                   STACKVIEW_EXACT_CLASS,
                                   timeout=2.0, search_depth=20)
             if stack is not None:
-                log.info("chat opened (StackView found after normal-list re-click)")
+                log.info("chat opened (StackView found after right-pane click)")
                 return True
             feed = _native_find(self.window, "GroupControl",
                                  MESSAGE_ITEM_EXACT_CLASS,
@@ -683,7 +668,10 @@ class ViberClient:
             if feed is not None:
                 log.info("chat opened (FeedDelegate found, no StackView)")
                 return True
-            log.error("Chat verification failed even after normal-list re-click.")
+            log.error(
+                "Chat verification failed. Neither StackView nor FeedDelegate "
+                "found. Tried: search click → clear search → right-pane click."
+            )
             return False
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)
@@ -693,9 +681,17 @@ class ViberClient:
     def open_conversation(self, name: str) -> bool:
         return self.open_conversation_by_search(name)
 
+    def read_current_chat_messages(self, limit: int = 20, conversation_label: str = "") -> list[ViberMessage]:
+        """Read messages from WHATEVER chat is currently open in Viber.
+        Does not navigate — uses only native FindFirst to enumerate the
+        currently-visible FeedDelegate controls and read their ValuePattern.
+        """
+        self._ensure_attached()
+        return self._read_open_chat(conversation_label or "<current>", limit)
+
     # ---- Reading messages --------------------------------------------
     def read_new_messages(self, name: str, limit: int = 20) -> list[ViberMessage]:
-        """Read the last `limit` messages from the currently open chat.
+        """Read the last `limit` messages from the chat with `name`.
 
         CRITICAL: this method uses ONLY native FindFirst-based lookups and
         direct child navigation. Never calls GetChildren() or does recursive
@@ -705,7 +701,11 @@ class ViberClient:
         self._ensure_attached()
         if not self.open_conversation(name):
             return []
+        return self._read_open_chat(name, limit)
 
+    def _read_open_chat(self, name: str, limit: int) -> list[ViberMessage]:
+        """Shared implementation: read FeedDelegate values from the currently
+        open chat (whichever one that is)."""
         time.sleep(0.5)  # let Viber render + Qt accessibility settle
 
         # Enumerate FeedDelegate GroupControls via foundIndex loop.
