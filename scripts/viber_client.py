@@ -750,7 +750,6 @@ class ViberClient:
     # (row height ≈72 px for individual rows, up to ~305 px for grouped
     # section delegates — either way the click target is the top third).
     _SIDEBAR_SEARCH_RESULT_Y_OFFSET = 261
-    _SIDEBAR_NORMAL_ROW_Y_OFFSET = 81
     _SIDEBAR_ROW_CENTER_Y_OFFSET = 36   # ~half a 72 px row
 
     def _record_search_result_offset(self, sb, row_bounds: tuple) -> None:
@@ -802,30 +801,12 @@ class ViberClient:
             log.error("blind-click at (%d,%d) failed: %s", cx, cy, e)
             return False
 
-    def _blind_click_top_normal_row(self, sb) -> bool:
-        """Click the topmost normal-list sidebar row relative to the
-        search box's live bounds. Used after clearing search when UIA
-        enumeration of the normal list returns 0 rows.
-        """
-        bnds = _read_bounds_live(sb)
-        if bnds is None:
-            log.error("blind-click: search box has no bounds; cannot anchor")
-            return False
-        sb_l, sb_t, sb_r, _sb_b = bnds
-        cx = sb_l + 10
-        cy = (sb_t
-              + self._SIDEBAR_NORMAL_ROW_Y_OFFSET
-              + self._SIDEBAR_ROW_CENTER_Y_OFFSET)
-        log.warning("UIA normal-list dead — blind-clicking top normal "
-                    "row at (%d,%d), anchored to search box "
-                    "bounds=(%d,%d,%d,%d)",
-                    cx, cy, sb_l, sb_t, sb_r, bnds[3])
-        try:
-            auto.Click(cx, cy, waitTime=0.1)
-            return True
-        except Exception as e:
-            log.error("blind-click at (%d,%d) failed: %s", cx, cy, e)
-            return False
+    # (_blind_click_top_normal_row was removed along with the two-step
+    # re-click after verification: re-clicking "the topmost normal-list
+    # row" on the assumption that the just-opened chat had bubbled to
+    # index 0 silently opened the wrong contact when it hadn't. We now
+    # trust the first click + visual state if UIA doesn't expose the
+    # pane within 3 s.)
 
     # ---- Conversation navigation ------------------------------------
     def list_conversations(self) -> list[ViberConversation]:
@@ -1273,100 +1254,24 @@ class ViberClient:
                     log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                     return False
 
-            # Chat is visually open on the right, but Viber is now in
-            # hybrid 'search+chat' mode: the StackView and FeedDelegate
-            # are NOT exposed to UIA even though they're rendered. Qt's
-            # accessibility bridge only populates them in 'normal chat
-            # mode' — i.e. a chat opened from the normal conversation
-            # list, not from search results.
+            # Chat is now visually open on the right. On modern Viber
+            # builds the StackView is usually exposed to UIA immediately
+            # after a search-result click — so verify first, and only
+            # fall back to the two-step re-click dance if Qt's
+            # accessibility bridge hasn't caught up.
             #
-            # Two-step navigation (restored from 6e0cf41, removed by
-            # mistake in 99bbb78):
-            #   1. Clear search with keyboard only (no UIA clicks to
-            #      preserve the tree).
-            #   2. Re-click the topmost visible delegate in the normal
-            #      conversation list. Since we just opened this chat,
-            #      it will have bubbled to the top of the recency-sorted
-            #      list. Clicking it re-opens the same chat in 'normal
-            #      chat mode' which DOES expose the StackView.
+            # History: we used to unconditionally clear the search and
+            # re-click "the topmost visible delegate" on the assumption
+            # that Qt only populated StackView in normal-chat-mode. That
+            # was true on older builds but is fragile — Viber only
+            # bumps a conversation to the top of the recency list when
+            # a NEW message arrives, not when you merely click into it.
+            # On a fresh open, the chat we just clicked has NOT yet
+            # bubbled to index 0, so "re-click the topmost normal row"
+            # silently opens whoever was at the top (usually a different
+            # contact), overwriting our intended chat and routing sends
+            # to the wrong person.
             time.sleep(0.5)
-            try:
-                auto.SendKeys("{Esc}", waitTime=0.15)
-                auto.SendKeys("{Ctrl}a", waitTime=0.05)
-                auto.SendKeys("{Delete}", waitTime=0.1)
-                auto.SendKeys("{Esc}", waitTime=0.15)
-            except Exception as e:
-                log.debug("clearing search: %s", e)
-
-            # Wait for the normal conversation list to redraw.
-            time.sleep(1.0)
-
-            # Enumerate normal-list delegates. Viber has shipped these
-            # under multiple QML-type suffixes (_QML_1615, _QML_1643, and
-            # possibly others on future builds) so we match the stable
-            # prefix and filter by sidebar geometry — same pattern as the
-            # first-click enumeration above.
-            ROW_CLASS_PREFIX = CONVERSATION_ROW_CLASS_PREFIX
-            normal_captured: list[tuple] = []
-            for i in range(1, 15):
-                try:
-                    ctrl = auto.GroupControl(
-                        searchFromControl=self.window,
-                        AutomationId="delegateLoader",
-                        foundIndex=i,
-                        searchDepth=4,
-                    )
-                    if not ctrl.Exists(0.0, 0):
-                        break
-                    try:
-                        ncls = ctrl.ClassName or ""
-                    except Exception:
-                        ncls = ""
-                    if not ncls.startswith(ROW_CLASS_PREFIX):
-                        continue
-                    nb = _read_bounds_live(ctrl)
-                    if nb is None:
-                        continue
-                    nw = nb[2] - nb[0]; nh = nb[3] - nb[1]
-                    if nw < 200 or nw > 400 or nh < 40 or nh > 200:
-                        continue
-                    normal_captured.append((ctrl, nb, ncls))
-                except Exception:
-                    break
-            # Dedup by (left, top) and sort by top.
-            nseen = set(); normal_unique: list[tuple] = []
-            for tup in normal_captured:
-                key = (tup[1][0], tup[1][1])
-                if key in nseen:
-                    continue
-                nseen.add(key)
-                normal_unique.append(tup)
-            normal_unique.sort(key=lambda t: t[1][1])
-
-            if normal_unique:
-                _nctrl, nb, ncls = normal_unique[0]
-                ncx = nb[0] + 50
-                ncy = nb[1] + min(30, max(10, (nb[3] - nb[1]) // 3))
-                log.info("re-clicking topmost normal-list row at (%d,%d) "
-                         "[bounds=(%d,%d,%d,%d) cls=%r] to enter normal chat mode",
-                         ncx, ncy, nb[0], nb[1], nb[2], nb[3], ncls[:50])
-                try:
-                    auto.Click(ncx, ncy, waitTime=0.1)
-                except Exception as e:
-                    log.debug("normal-list re-click failed: %s", e)
-            else:
-                # UIA can't see normal-list rows either. Blind-click
-                # the top normal-row slot anchored to the search box.
-                # The chat we just opened has bubbled to the top of
-                # the recency-sorted list, so the topmost slot is
-                # always the correct target.
-                log.warning("no normal-list rows visible via UIA after "
-                            "clearing search; attempting blind-click "
-                            "fallback")
-                self._blind_click_top_normal_row(search)
-
-            # Give Viber time to transition and expose the StackView.
-            time.sleep(1.5)
 
             # Verify via native FindFirst for StackView / FeedDelegate /
             # input box. Any of the three is a strong signal the right
@@ -1392,24 +1297,38 @@ class ViberClient:
                     return True
                 return False
 
+            # Poll for up to ~3 s giving Qt a chance to publish the pane.
             if _verify_now():
                 return True
-
-            # Second chance: wait a bit longer and try again. Qt can be
-            # slow on heavy chats (lots of history / attachments).
+            time.sleep(1.0)
+            if _verify_now():
+                return True
             time.sleep(1.5)
             if _verify_now():
                 return True
 
-            # Last resort: if we DID successfully click a row with real
-            # bounds, the chat is probably open visually even if Qt isn't
-            # exposing the pane. Trust the click and let downstream
-            # send/read surface specific errors.
+            # StackView still not exposed to UIA even though the chat is
+            # visually open on the right. We DELIBERATELY do NOT clear
+            # the search and re-click anything: that path previously
+            # tried to re-open "the topmost normal-list row" on the
+            # assumption that the just-opened chat had bubbled to index
+            # 0 of the recency list. It hadn't — Viber only re-sorts on
+            # new-message arrival, not on click — so the re-click
+            # silently opened a different contact and routed sends to
+            # the wrong person (see issue #33).
+            #
+            # Trusting the visual state here is safe for send_message:
+            # its downstream _native_find for the input box will locate
+            # it via the globally-unique QQuickTextEdit prefix regardless
+            # of which mode Viber's tree is in. For read_new_messages it
+            # will surface "0 FeedDelegate visible" — a specific,
+            # recoverable error — if Qt truly can't see the pane.
             log.warning(
                 "Chat verification could not locate StackView, FeedDelegate "
-                "or input box after two-step navigation. Clicked row bounds=%r. "
-                "Trusting the click; downstream send/read will give a more "
-                "specific error if the chat didn't actually open.",
+                "or input box after first click. Clicked row bounds=%r. "
+                "Trusting the click instead of risking a misrouted re-click; "
+                "downstream send/read will give a more specific error if the "
+                "chat didn't actually open.",
                 bnds,
             )
             return True
