@@ -739,9 +739,18 @@ class ViberClient:
 
     def _focus_window(self):
         """Bring the Viber window to the foreground so UIA can actually click.
+
         Qt renders delegates lazily — off-screen / unfocused windows often
-        have zero-size bounding rects even for "present" controls.
+        have zero-size bounding rects even for "present" controls. And if
+        Viber isn't the foreground window when we SendKeys, the keystrokes
+        go into whichever window IS foreground (terminal, Matrix client).
+
+        Windows 11 deliberately blocks SetForegroundWindow() from non-
+        foreground processes as an anti-focus-stealing measure. The
+        well-known workaround is to temporarily attach our thread's input
+        queue to the foreground window's thread, which lifts the block.
         """
+        # 1. Library-level focus (harmless if it doesn't work).
         try:
             self.window.SetActive()
         except Exception:
@@ -756,6 +765,66 @@ class ViberClient:
             self.window.SetFocus()
         except Exception:
             pass
+
+        # 2. Win32 AttachThreadInput trick to defeat Windows 11's
+        #    foreground-lock. No-op on non-Windows platforms (import
+        #    will fail silently).
+        try:
+            hwnd = self.window.NativeWindowHandle
+            if hwnd:
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                SW_RESTORE = 9
+                # If minimised, un-minimise first.
+                try:
+                    if user32.IsIconic(hwnd):
+                        user32.ShowWindow(hwnd, SW_RESTORE)
+                except Exception:
+                    pass
+                # Attach our thread's input queue to the foreground
+                # thread, call SetForegroundWindow, then detach.
+                fg_hwnd = user32.GetForegroundWindow()
+                our_tid = kernel32.GetCurrentThreadId()
+                fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+                attached = False
+                if fg_tid and fg_tid != our_tid:
+                    try:
+                        attached = bool(user32.AttachThreadInput(our_tid, fg_tid, True))
+                    except Exception:
+                        attached = False
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetFocus(hwnd)
+                except Exception:
+                    pass
+                if attached:
+                    try:
+                        user32.AttachThreadInput(our_tid, fg_tid, False)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug("_focus_window win32 path: %s", e)
+        # Small settle so Qt has time to redraw / populate delegates.
+        time.sleep(0.1)
+
+    def _read_search_text(self, search_ctrl) -> str:
+        """Return the current value of the search box, or ''. Used to
+        verify a paste / typed query actually landed in the box."""
+        if search_ctrl is None:
+            return ""
+        for getter in (
+            lambda: search_ctrl.GetValuePattern().Value,
+            lambda: search_ctrl.GetLegacyIAccessiblePattern().Value,
+            lambda: search_ctrl.Name,
+        ):
+            try:
+                v = getter()
+                if v:
+                    return str(v).strip()
+            except Exception:
+                continue
+        return ""
 
     def open_conversation_by_search(self, name: str) -> bool:
         """Navigate to the chat with the given contact / group by typing the
@@ -778,15 +847,52 @@ class ViberClient:
             log.error("Search box not found — check SEARCH_BOX selector")
             return False
         try:
-            search.Click(simulateMove=False)
-            time.sleep(0.15)
-            auto.SendKeys("{Ctrl}a", waitTime=0.05)
-            auto.SendKeys("{Delete}", waitTime=0.05)
-            # Paste the query via clipboard (unicode-safe)
+            # Focus the search box and paste the query. Verify the paste
+            # actually landed by reading the box's Value back; if it
+            # didn't, retry up to 3 times. This catches the common
+            # failure where Viber wasn't the foreground window so
+            # SendKeys went to the terminal / Matrix client.
             pyperclip.copy(name)
-            auto.SendKeys("{Ctrl}v", waitTime=0.1)
-            # Give the list time to re-filter
-            time.sleep(0.7)
+            pasted_ok = False
+            for attempt in range(3):
+                try:
+                    search.Click(simulateMove=False)
+                except Exception as e:
+                    log.debug("attempt %d: search.Click failed: %s", attempt + 1, e)
+                time.sleep(0.15)
+                try:
+                    auto.SendKeys("{Ctrl}a", waitTime=0.05)
+                    auto.SendKeys("{Delete}", waitTime=0.05)
+                    auto.SendKeys("{Ctrl}v", waitTime=0.1)
+                except Exception as e:
+                    log.debug("attempt %d: SendKeys failed: %s", attempt + 1, e)
+                time.sleep(0.5)
+                current = self._read_search_text(search)
+                if current and name.lower() in current.lower():
+                    log.info("search-box text confirmed on attempt %d: %r",
+                             attempt + 1, current[:60])
+                    pasted_ok = True
+                    break
+                log.warning("attempt %d: expected %r in search box, got %r; "
+                            "re-focusing Viber and retrying",
+                            attempt + 1, name, current[:60])
+                # Re-focus and try again. The foreground may have been
+                # stolen by the terminal that logged the previous line.
+                self._focus_window()
+                time.sleep(0.2)
+
+            if not pasted_ok:
+                log.error(
+                    "Could not get %r into Viber's search box after 3 "
+                    "attempts. Viber may not be accepting keyboard input "
+                    "(minimised? covered by a modal? focus-stolen?). Last "
+                    "read-back: %r. Try foregrounding Viber manually.",
+                    name, self._read_search_text(search)[:60],
+                )
+                return False
+
+            # Give the list time to re-filter after the (confirmed) paste.
+            time.sleep(0.5)
 
             # Enumerate search-result delegates and CAPTURE bounds + name
             # inline during enumeration. Rationale: ``uiautomation``'s
