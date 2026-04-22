@@ -72,21 +72,33 @@ curl -XPOST -d '{"type":"m.login.password","user":"viber","password":"<password>
   https://matrix.example.com/_matrix/client/v3/login
 ```
 
-### 2. Invite `@viber:example.com` to a control room
+### 2. Create an **UNENCRYPTED** control room
 
-In Element (as `@admin:example.com`):
-1. Create a new **private** room named something like "Viber Control"
-2. Invite `@viber:example.com`
-3. Copy the room ID (Room Settings → Advanced → Internal room ID, looks like `!abc123:example.com`)
-4. Paste into `config.yaml` as `matrix.control_room_id`
+> 🚨 **Critical:** The control room MUST NOT be end-to-end encrypted.
+> This bridge is built without libolm (see Step 5), so it cannot decrypt
+> Megolm events. Matrix rooms cannot have encryption turned off once it's
+> been turned on — if you pick wrong, you'll have to create a new room.
+>
+> Element's default for "private" rooms **is encrypted**, and the toggle
+> is buried. The reliable way is to create the room via the API.
 
-**Then accept the invite on the bridge user's behalf** — the @viber account has no UI, so you do it with a single API call. Use the helper:
+Run the helper with your **admin** access token (yours, not the bridge's):
 
 ```bash
-bash matrix-setup/accept-invite.sh '!abc123:example.com' 'syt_dmliZXI_xxx...'
+bash matrix-setup/create-control-room.sh '<your_admin_token>' '@viber:example.com'
 ```
 
-(You'll run this again for any future room you invite `@viber` into manually.)
+Your admin token is in Element: Settings → Help & About → Advanced → Access Token.
+
+The helper will print the new room ID. Then:
+
+1. Paste the room ID into `scripts/config.yaml` as `matrix.control_room_id`
+2. Accept the invite as `@viber`:
+   ```bash
+   bash matrix-setup/accept-invite.sh '<new_room_id>' '<viber_access_token>'
+   ```
+
+(If you must do it in the Element UI: **uncheck** "Enable end-to-end encryption" when creating the room. Do this via Room Options → Security, not the default room-create dialog which hides the setting.)
 
 ### 3. Create the working folder on Windows
 
