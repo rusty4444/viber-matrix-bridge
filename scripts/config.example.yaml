@@ -1,0 +1,30 @@
+matrix:
+  homeserver_url: "https://matrix.samprim.net"
+  user_id: "@viber:samprim.net"
+  access_token: "syt_dmliZXI_XXXXXXXXXXXXX_XXXXXX"   # from register-viber-user.sh
+  device_id: "XXXXXXXXXX"
+  control_room_id: "!CHANGE_ME:samprim.net"          # the private room you invited @viber into
+  admin_user_id: "@sam.russell:samprim.net"          # only this user can run commands
+  room_name_prefix: "Viber · "                       # new rooms auto-named "Viber · <contact>"
+
+viber:
+  window_title: "Viber"                              # window title substring (case-insensitive)
+  poll_interval_seconds: 3                           # how often to scan for new messages
+  backend: "uiautomation"                            # uiautomation | pywinauto (uiautomation recommended)
+  typing_delay_ms: 20                                # per-char delay when pasting replies
+  click_pause_ms: 150                                # pause between UI actions
+
+bridge:
+  state_db: "C:\\viber-bridge\\state.db"
+  log_file: "C:\\viber-bridge\\bridge.log"
+  log_level: "INFO"                                  # DEBUG | INFO | WARNING | ERROR
+  echo_suppression_window_seconds: 30                # dedup window for our own messages
+  startup_message: "Viber bridge online"             # posted to control room on start
+  max_backfill_per_chat: 5                           # messages to read on first sight of a chat
+  room_per_chat: true                                # true = one Matrix room per Viber chat
+
+# Optional: LLM fallback for unexpected UI states (off by default)
+llm_fallback:
+  enabled: false
+  # When enabled, will call a vision-capable model if the Viber UI tree is
+  # unparseable. Not recommended unless you've already tuned selectors.

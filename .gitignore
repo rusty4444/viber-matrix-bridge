@@ -1,0 +1,12 @@
+config.yaml
+*.db
+*.log
+venv/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+nssm.exe
+service.stdout.log
+service.stderr.log
+state.db
