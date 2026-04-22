@@ -238,7 +238,7 @@ To remove: `uninstall-service.bat`.
 | `!pairhere <viber name>` | Pair the chat currently open in Viber to a new Matrix room — **most reliable**, you navigate in Viber, bridge reads what's open |
 | `!addchat <viber name>` | Search for a Viber chat by name, click the top match, then pair a new Matrix room. Can fail if UIA misbehaves on the target build — fall back to `!pairhere` |
 | `!pair <!room_id> <viber name>` | Pair an existing Matrix room to a Viber chat manually (no Viber interaction) |
-| `!unpair <viber name>` | Remove a pairing |
+| `!removechat <viber name>` | Remove a pairing (aliases: `!unpair`, `!deletechat`) |
 | `!test <viber name>` | Open a chat by search and read the last 5 messages (diagnostic) |
 | `!poll on\|off\|status` | Toggle the incoming-message poll loop at runtime (default OFF; 30 s minimum interval; not persistent across restarts) |
 | `!reload` | Re-attach to the Viber window |

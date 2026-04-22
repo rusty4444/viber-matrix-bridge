@@ -243,7 +243,7 @@ class Bridge:
                 "  !pairhere <viber name> — create a Matrix room paired to the chat currently open in Viber (most reliable)\n"
                 "  !addchat <viber name> — search + navigate + create a Matrix room (may fail, UIA limitations)\n"
                 "  !pair <!room_id> <viber name> — manually pair an existing room\n"
-                "  !unpair <viber name> — remove pairing\n"
+                "  !removechat <viber name> — remove pairing (alias: !unpair, !deletechat)\n"
                 "  !test <viber name> — try navigating to a chat and reading messages\n"
                 "  !reload — re-attach to Viber\n"
             )
@@ -336,12 +336,12 @@ class Bridge:
             vname = " ".join(args[1:])
             await self.state.set_mapping(vname, room_id)
             return f"paired {vname!r} → {room_id}"
-        if cmd == "unpair":
+        if cmd in ("removechat", "deletechat", "unpair"):
             if not args:
-                return "usage: !unpair <viber name>"
+                return f"usage: !{cmd} <viber name>"
             vname = " ".join(args)
             await self.state.delete_mapping(vname)
-            return f"unpaired {vname!r}"
+            return f"removed pairing for {vname!r}"
         if cmd == "reload":
             try:
                 self.viber.window = None

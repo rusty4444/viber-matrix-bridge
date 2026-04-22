@@ -894,118 +894,170 @@ class ViberClient:
             # Give the list time to re-filter after the (confirmed) paste.
             time.sleep(0.5)
 
-            # Enumerate search-result delegates and CAPTURE bounds + name
-            # inline during enumeration. Rationale: ``uiautomation``'s
-            # foundIndex-based traversal returns fresh UIA proxies on each
-            # iteration, and the proxies collected earlier in the loop can
-            # report zero-area BoundingRectangle when re-queried later
-            # (Qt's IAccessible implementation sometimes detaches proxies
-            # after further tree activity). So we record every property we
-            # need into plain tuples right when we first see the row.
-            #
             # Viber has shipped these rows under multiple QML-type suffixes
             # across versions (ListViewDelegateLoader_QMLTYPE_465_QML_<NNNN>).
             # We match the stable prefix and filter by sidebar geometry.
             ROW_CLASS_PREFIX = "ListViewDelegateLoader_QMLTYPE_465"
-            # Each entry: (ctrl, (l, t, r, b), class_name, name_text, aid)
-            captured: list[tuple] = []
-            for i in range(1, 40):
-                try:
-                    ctrl = auto.GroupControl(
-                        searchFromControl=self.window,
-                        AutomationId="delegateLoader",
-                        foundIndex=i,
-                        searchDepth=4,
-                    )
-                    if not ctrl.Exists(0.0, 0):
-                        break
-                    try:
-                        cls = ctrl.ClassName or ""
-                    except Exception:
-                        cls = ""
-                    if not cls.startswith(ROW_CLASS_PREFIX):
-                        # Skip small unrelated delegates (e.g. the profile
-                        # button at the top-left, a QQuickLoader that also
-                        # carries AutomationId='delegateLoader').
-                        continue
-                    bounds = _read_bounds_live(ctrl)
-                    if bounds is None:
-                        continue
-                    w = bounds[2] - bounds[0]
-                    h = bounds[3] - bounds[1]
-                    # Sidebar search-result row geometry: width ~280–340 px,
-                    # height ~60–90 px. Be generous at the bounds.
-                    if w < 200 or w > 400:
-                        continue
-                    if h < 40 or h > 200:
-                        continue
-                    try:
-                        row_name = (ctrl.Name or "").strip()
-                    except Exception:
-                        row_name = ""
-                    try:
-                        row_aid = (ctrl.AutomationId or "").strip()
-                    except Exception:
-                        row_aid = ""
-                    captured.append((ctrl, bounds, cls, row_name, row_aid))
-                except Exception:
-                    break
 
-            # Secondary fallback: if the AID-based enumeration produced
-            # nothing (e.g. Viber changed the AutomationId convention),
-            # try the old exact-class selectors for both known suffixes.
-            if not captured:
-                for suffix in ("_QML_1615", "_QML_1643"):
-                    for i in range(1, 15):
-                        try:
-                            ctrl = auto.GroupControl(
-                                searchFromControl=self.window,
-                                ClassName=f"{ROW_CLASS_PREFIX}{suffix}",
-                                foundIndex=i,
-                                searchDepth=3,
-                            )
-                            if not ctrl.Exists(0.0, 0):
-                                break
-                            bounds = _read_bounds_live(ctrl)
-                            if bounds is None:
-                                continue
-                            try:
-                                row_name = (ctrl.Name or "").strip()
-                            except Exception:
-                                row_name = ""
-                            try:
-                                row_aid = (ctrl.AutomationId or "").strip()
-                            except Exception:
-                                row_aid = ""
-                            captured.append((ctrl, bounds, f"{ROW_CLASS_PREFIX}{suffix}",
-                                             row_name, row_aid))
-                        except Exception:
+            def _enumerate_search_delegates() -> list[tuple]:
+                """Walk the UIA tree and CAPTURE bounds + name inline for
+                every search-result delegate. Returns a deduped, top-sorted
+                list of (ctrl, (l,t,r,b), class_name, name_text, aid) tuples.
+
+                Rationale for inline capture: ``uiautomation``'s foundIndex
+                traversal returns fresh UIA proxies per iteration, and
+                proxies collected earlier can report zero-area
+                BoundingRectangle when re-queried later (Qt's IAccessible
+                sometimes detaches proxies after further tree activity).
+                """
+                captured: list[tuple] = []
+                for i in range(1, 40):
+                    try:
+                        ctrl = auto.GroupControl(
+                            searchFromControl=self.window,
+                            AutomationId="delegateLoader",
+                            foundIndex=i,
+                            searchDepth=4,
+                        )
+                        if not ctrl.Exists(0.0, 0):
                             break
-                    if captured:
+                        try:
+                            cls = ctrl.ClassName or ""
+                        except Exception:
+                            cls = ""
+                        if not cls.startswith(ROW_CLASS_PREFIX):
+                            # Skip small unrelated delegates (e.g. the
+                            # profile button at the top-left, a QQuickLoader
+                            # that also carries AID='delegateLoader').
+                            continue
+                        bounds = _read_bounds_live(ctrl)
+                        if bounds is None:
+                            continue
+                        w = bounds[2] - bounds[0]
+                        h = bounds[3] - bounds[1]
+                        # Sidebar search-result row geometry: width
+                        # ~280–340 px, height ~60–90 px. Be generous.
+                        if w < 200 or w > 400:
+                            continue
+                        if h < 40 or h > 200:
+                            continue
+                        try:
+                            row_name = (ctrl.Name or "").strip()
+                        except Exception:
+                            row_name = ""
+                        try:
+                            row_aid = (ctrl.AutomationId or "").strip()
+                        except Exception:
+                            row_aid = ""
+                        captured.append((ctrl, bounds, cls, row_name, row_aid))
+                    except Exception:
                         break
 
-            # Dedup by (left, top) — Qt's UIA bug sometimes returns the same
-            # element many times via different tree paths.
-            seen_pos = set()
-            unique: list[tuple] = []
-            for tup in captured:
-                key = (tup[1][0], tup[1][1])
-                if key in seen_pos:
-                    continue
-                seen_pos.add(key)
-                unique.append(tup)
-            # Sort by cached top coordinate (don't re-query BoundingRectangle).
-            unique.sort(key=lambda t: t[1][1])
+                # Secondary fallback: if the AID-based enumeration produced
+                # nothing, try the old exact-class selectors for both known
+                # suffixes.
+                if not captured:
+                    for suffix in ("_QML_1615", "_QML_1643"):
+                        for i in range(1, 15):
+                            try:
+                                ctrl = auto.GroupControl(
+                                    searchFromControl=self.window,
+                                    ClassName=f"{ROW_CLASS_PREFIX}{suffix}",
+                                    foundIndex=i,
+                                    searchDepth=3,
+                                )
+                                if not ctrl.Exists(0.0, 0):
+                                    break
+                                bounds = _read_bounds_live(ctrl)
+                                if bounds is None:
+                                    continue
+                                try:
+                                    row_name = (ctrl.Name or "").strip()
+                                except Exception:
+                                    row_name = ""
+                                try:
+                                    row_aid = (ctrl.AutomationId or "").strip()
+                                except Exception:
+                                    row_aid = ""
+                                captured.append((ctrl, bounds,
+                                                 f"{ROW_CLASS_PREFIX}{suffix}",
+                                                 row_name, row_aid))
+                            except Exception:
+                                break
+                        if captured:
+                            break
 
-            log.info("after search %r: %d delegate(s) captured, %d unique",
-                     name, len(captured), len(unique))
+                # Dedup by (left, top) — Qt's UIA bug sometimes returns the
+                # same element many times via different tree paths.
+                seen_pos = set()
+                uniq: list[tuple] = []
+                for tup in captured:
+                    key = (tup[1][0], tup[1][1])
+                    if key in seen_pos:
+                        continue
+                    seen_pos.add(key)
+                    uniq.append(tup)
+                # Sort by cached top coordinate (don't re-query bounds).
+                uniq.sort(key=lambda t: t[1][1])
+                return uniq
+
+            # Retry enumeration up to 3 times if we get 0 rows. Qt's QML
+            # list is virtualized and sometimes takes noticeably longer
+            # than the initial 0.5 s to populate delegates in the UIA tree
+            # — especially on a repeat search for the same name, where
+            # Qt's accessibility cache appears to briefly hold stale empty
+            # state. Between retries, re-verify the search text is still
+            # in the box (a focus change could have cleared it) and
+            # re-foreground Viber to keep it accepting input.
+            unique: list[tuple] = []
+            ENUM_RETRIES = 3
+            for enum_attempt in range(ENUM_RETRIES):
+                unique = _enumerate_search_delegates()
+                if unique:
+                    if enum_attempt > 0:
+                        log.info("delegate enumeration succeeded on attempt %d",
+                                 enum_attempt + 1)
+                    break
+                if enum_attempt == ENUM_RETRIES - 1:
+                    break
+                # Confirm the search text is still in the box; if it was
+                # cleared by focus loss, re-paste before retrying.
+                current = self._read_search_text(search)
+                if not current or name.lower() not in current.lower():
+                    log.warning("enum attempt %d: 0 rows AND search box "
+                                "lost text (%r); re-pasting",
+                                enum_attempt + 1, current[:60])
+                    self._focus_window()
+                    time.sleep(0.15)
+                    try:
+                        search.Click(simulateMove=False)
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                    try:
+                        auto.SendKeys("{Ctrl}a", waitTime=0.05)
+                        auto.SendKeys("{Delete}", waitTime=0.05)
+                        auto.SendKeys("{Ctrl}v", waitTime=0.1)
+                    except Exception as e:
+                        log.debug("re-paste SendKeys failed: %s", e)
+                else:
+                    log.info("enum attempt %d: 0 rows, search text intact "
+                            "(%r); waiting for Qt to populate delegates",
+                            enum_attempt + 1, current[:60])
+                # Progressively longer waits: 0.8 s, 1.5 s.
+                time.sleep(0.8 + 0.7 * enum_attempt)
+
+            log.info("after search %r: %d unique delegate(s)",
+                     name, len(unique))
 
             if not unique:
-                log.error("No search-result rows matched after search %r. "
-                          "Viber may be minimised, not focused, or the contact "
-                          "name didn't match anything. Tried AID=delegateLoader "
-                          "with class prefix %r and geometry 200–400px x 40–200px.",
-                          name, ROW_CLASS_PREFIX)
+                log.error("No search-result rows matched after search %r "
+                          "(tried %d enumeration attempts). Viber may be "
+                          "minimised, not focused, or the contact name "
+                          "didn't match anything. Tried AID=delegateLoader "
+                          "with class prefix %r and geometry "
+                          "200–400px x 40–200px.",
+                          name, ENUM_RETRIES, ROW_CLASS_PREFIX)
                 return False
 
             # Log every captured row's cached properties for diagnostics.
