@@ -113,22 +113,22 @@ CONVERSATION_ROW = Selector(
 # ---------------------------------------------------------------------------
 # Active chat (StackView)
 # ---------------------------------------------------------------------------
-# Individual message bubbles inside the open chat. These are EditControls;
-# the message text is exposed via the Value pattern, not the Name property.
+# Each message bubble is a GroupControl with class ``FeedDelegate_QMLTYPE_1077``
+# — CONFIRMED via Microsoft Accessibility Insights inspection of a live chat.
+# Message text is exposed through the ValuePattern (not Name). Multiple
+# FeedDelegate instances are siblings directly under the StackView.
 MESSAGE_ITEM = Selector(
-    control_type="EditControl",
-    class_name=r"TextEditItem_QMLTYPE_\d+",
-    fallback="Message text item (TextEditItem_QMLTYPE_* — read via ValuePattern)",
-)
-
-# The FeedDelegate GroupControl inside StackView is technically the message
-# feed container, but in practice the TextEditItem messages render as direct
-# children of StackView alongside it. Listed for completeness.
-MESSAGE_FEED = Selector(
     control_type="GroupControl",
     class_name=r"FeedDelegate_QMLTYPE_\d+",
-    fallback="Message feed container (usually empty via UIA)",
+    fallback="Message bubble (FeedDelegate_QMLTYPE_* — text via ValuePattern)",
 )
+
+# Observed exact class value (for the exact-match native search fallback).
+MESSAGE_ITEM_EXACT_CLASS = "FeedDelegate_QMLTYPE_1077"
+
+# StackView exact class (for native FindFirst-based search).
+STACKVIEW_EXACT_CLASS = "StackView_QMLTYPE_463"
+INPUT_BOX_EXACT_CLASS = "QQuickTextEdit_QML_1021"
 
 # Message input box. Viber uses a plain Qt QQuickTextEdit for this — NOT a
 # TextFieldItem (which is the search box) or TextEditItem (which is a

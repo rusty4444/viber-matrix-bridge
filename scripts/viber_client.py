@@ -37,6 +37,9 @@ from viber_selectors import (
     SEARCH_BOX,
     CONVERSATION_ROW,
     MESSAGE_ITEM,
+    MESSAGE_ITEM_EXACT_CLASS,
+    STACKVIEW_EXACT_CLASS,
+    INPUT_BOX_EXACT_CLASS,
     INPUT_BOX,
     SEND_BUTTON,
     SCROLL_TO_BOTTOM,
@@ -162,6 +165,69 @@ def _visible_bounds(el) -> tuple[int, int, int, int] | None:
 
 def _is_visible(el) -> bool:
     return _visible_bounds(el) is not None
+
+
+def _native_find(parent, control_type_name: str, class_name: str,
+                 timeout: float = 5.0, search_depth: int = 20):
+    """Find a control using uiautomation's NATIVE search (IUIAutomation::
+    FindFirst under the hood), not our recursive GetChildren() walker.
+
+    This is what Accessibility Insights uses, and crucially it returns
+    fresh results after UI state changes (search->chat) where GetChildren()
+    returns stale results for several seconds.
+
+    Args:
+        parent: parent uiautomation control
+        control_type_name: one of 'PaneControl', 'GroupControl', 'EditControl', etc.
+        class_name: EXACT ClassName to match (no regex)
+        timeout: total seconds to wait for the control to appear
+        search_depth: UIA tree depth limit
+    """
+    if auto is None:
+        raise ViberError("uiautomation not available on this platform")
+    ctype = getattr(auto, control_type_name, None)
+    if ctype is None:
+        return None
+    try:
+        ctrl = ctype(
+            searchFromControl=parent,
+            ClassName=class_name,
+            searchDepth=search_depth,
+        )
+        if ctrl.Exists(timeout, 0.2):
+            return ctrl
+    except Exception as e:
+        log.debug("_native_find failed: %s", e)
+    return None
+
+
+def _native_find_all(parent, control_type_name: str, class_name_regex: str,
+                    search_depth: int = 20):
+    """Find ALL descendants matching a regex class name via uiautomation's
+    GetDescendantControls with a Python predicate.
+
+    Unlike _find_all, this uses uiautomation's tree walker which is more
+    reliable right after UI transitions.
+    """
+    if auto is None:
+        return []
+    pat = re.compile(class_name_regex)
+    try:
+        def pred(c):
+            try:
+                if c.ControlTypeName != control_type_name:
+                    return False
+                return bool(pat.search(c.ClassName or ""))
+            except Exception:
+                return False
+        if hasattr(parent, "GetDescendantControls"):
+            return parent.GetDescendantControls(pred) or []
+        # Fallback: single descendant lookup
+        one = parent.GetDescendantControl(pred) if hasattr(parent, "GetDescendantControl") else None
+        return [one] if one else []
+    except Exception as e:
+        log.debug("_native_find_all failed: %s", e)
+        return []
 
 
 def _dedup_by_position(controls):
@@ -378,12 +444,28 @@ class ViberClient:
     def _app_content(self):
         return _find(self.window, APP_CONTENT, timeout=2.0)
 
-    def _chat_stack(self):
-        """Return the right-side StackView (active chat pane), or None."""
-        return _find(self.window, CHAT_STACK, timeout=2.0)
+    def _chat_stack(self, timeout: float = 2.0):
+        """Return the right-side StackView (active chat pane), or None.
+
+        Uses UIA's native FindFirst (via uiautomation's ControlType search)
+        because our recursive GetChildren() walker returns stale results
+        for several seconds after a UI mode change (search <-> chat).
+        """
+        # Try exact class name first (fast, native UIA path)
+        s = _native_find(self.window, "PaneControl", STACKVIEW_EXACT_CLASS,
+                         timeout=timeout, search_depth=20)
+        if s is not None:
+            return s
+        # Fallback: regex match via GetDescendantControl
+        matches = _native_find_all(self.window, "PaneControl",
+                                    r"StackView_QMLTYPE_\d+", search_depth=20)
+        return matches[0] if matches else None
 
     def _search_box(self):
-        return _find(self.window, SEARCH_BOX, timeout=1.5)
+        # Native search for the top TextFieldItem (search box)
+        matches = _native_find_all(self.window, "EditControl",
+                                    r"TextFieldItem_QMLTYPE_\d+", search_depth=12)
+        return matches[0] if matches else _find(self.window, SEARCH_BOX, timeout=1.5)
 
     # ---- Conversation navigation ------------------------------------
     def list_conversations(self) -> list[ViberConversation]:
@@ -498,34 +580,47 @@ class ViberClient:
             post_click_wait = max(self.cfg.get("click_pause_ms", 1000), 1000) / 1000.0
             time.sleep(post_click_wait)
 
-            # Re-attach the window handle in case the click caused Viber to
-            # rebuild its top-level UIA object.
-            try:
-                self.window = None
-                self.attach()
-            except ViberError:
-                pass
+            # DO NOT re-attach the window: our self.window reference is still
+            # valid, and re-attaching causes its own timing issues. We rely
+            # on UIA's native FindFirst for freshness instead.
 
             # Look for ANY of: the active-chat StackView, OR the message input
-            # box (QQuickTextEdit), OR a send button. Any of these = chat is
-            # actually open. Retry over ~5s since the tree can settle slowly.
+            # box (QQuickTextEdit), OR a FeedDelegate (message bubble). Any of
+            # these indicates the chat pane is actually open. Uses UIA's
+            # native FindFirst which returns fresh results after UI state
+            # changes (unlike our recursive GetChildren walker).
             stack = None
             input_box = None
-            deadline = time.monotonic() + 5.0
+            feed = None
+            deadline = time.monotonic() + 6.0
             while time.monotonic() < deadline:
-                stack = self._chat_stack()
+                stack = self._chat_stack(timeout=0.3)
                 if stack is not None:
-                    input_box = _find(stack, INPUT_BOX, timeout=0.2)
+                    input_box = _native_find(stack, "EditControl",
+                                              INPUT_BOX_EXACT_CLASS,
+                                              timeout=0.3, search_depth=10)
                     if input_box is not None:
                         break
-                # Fallback: maybe StackView selector mismatches post-click; any
-                # QQuickTextEdit in the window is a good sign.
-                input_box = _find(self.window, INPUT_BOX, timeout=0.2)
+                # Look for input box anywhere in window
+                input_box = _native_find(self.window, "EditControl",
+                                          INPUT_BOX_EXACT_CLASS,
+                                          timeout=0.3, search_depth=20)
                 if input_box is not None and _is_visible(input_box):
                     break
-                time.sleep(0.3)
+                # Or: any FeedDelegate (a message is rendered)
+                feed = _native_find(self.window, "GroupControl",
+                                     MESSAGE_ITEM_EXACT_CLASS,
+                                     timeout=0.3, search_depth=20)
+                if feed is not None and _is_visible(feed):
+                    break
+                time.sleep(0.2)
 
-            if stack is None and (input_box is None or not _is_visible(input_box)):
+            chat_is_open = (
+                stack is not None
+                or (input_box is not None and _is_visible(input_box))
+                or (feed is not None and _is_visible(feed))
+            )
+            if not chat_is_open:
                 log.error(
                     "Chat didn't open within 5s. Neither StackView nor a "
                     "visible message input was found. If Viber's right pane "
@@ -533,8 +628,8 @@ class ViberClient:
                     "result wasn't a real Conversation."
                 )
                 return False
-            log.info("chat opened successfully (stack=%s, input=%s)",
-                     bool(stack), bool(input_box))
+            log.info("chat opened successfully (stack=%s, input=%s, feed=%s)",
+                     bool(stack), bool(input_box), bool(feed))
 
             # Only NOW clear the search, once we know we're in the chat
             try:
@@ -568,14 +663,20 @@ class ViberClient:
             return []
 
         time.sleep(0.4)  # let Viber render the opened chat
-        stack = self._chat_stack()
-        if stack is None:
-            log.warning("Active chat StackView not found")
-            return []
 
-        # Messages are TextEditItem EditControls directly inside the StackView.
-        items = _find_all(stack, MESSAGE_ITEM, recursive=True, max_depth=4)
-        items = items[-limit:]  # most recent N visible bubbles
+        # Messages are FeedDelegate GroupControls (confirmed via Accessibility
+        # Insights). Use UIA's native descendant search for reliability after
+        # the chat-open transition.
+        raw = _native_find_all(self.window, "GroupControl",
+                                r"FeedDelegate_QMLTYPE_\d+", search_depth=20)
+        # Dedup by screen position (Qt QQuickControl nesting causes duplicates)
+        items = _dedup_by_position(raw)
+        # Keep only visible ones, sort top-to-bottom
+        items = [i for i in items if _is_visible(i)]
+        items.sort(key=lambda c: c.BoundingRectangle.top)
+        log.info("read_new_messages(%r): %d FeedDelegate total, %d unique visible",
+                 name, len(raw), len(items))
+        items = items[-limit:]  # most recent N
 
         messages: list[ViberMessage] = []
         for it in items:
