@@ -30,7 +30,10 @@ except ImportError:
 
 from viber_selectors import (
     MAIN_WINDOW,
-    CONVERSATION_LIST,
+    APP_CONTENT,
+    SPLIT_VIEW,
+    SIDEBAR_CONTENT,
+    CHAT_STACK,
     CONVERSATION_ITEM,
     UNREAD_BADGE,
     CHAT_HEADER_TITLE,
@@ -63,44 +66,85 @@ class ViberError(Exception):
     pass
 
 
-def _find(parent, selector, timeout: float = 2.0):
-    """Locate a UIA element under parent per selector. None if not found."""
+def _matches(el, selector) -> bool:
+    """Does this element satisfy the given selector?"""
+    try:
+        if el.ControlTypeName != selector.control_type:
+            return False
+        if selector.name is not None:
+            if selector.regex_name:
+                if not re.search(selector.name, el.Name or "", re.IGNORECASE):
+                    return False
+            else:
+                if (el.Name or "") != selector.name:
+                    return False
+        if selector.automation_id is not None:
+            # AutomationId matching is always substring (UIA values are long paths)
+            if selector.automation_id.lower() not in (el.AutomationId or "").lower():
+                return False
+        if selector.class_name is not None:
+            if selector.regex_class:
+                if not re.search(selector.class_name, el.ClassName or ""):
+                    return False
+            else:
+                if (el.ClassName or "") != selector.class_name:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+def _find(parent, selector, timeout: float = 2.0, recursive: bool = True):
+    """Locate the first descendant of `parent` matching `selector`.
+    Returns None if not found within `timeout` seconds.
+    """
     if auto is None:
         raise ViberError("uiautomation not available on this platform")
 
-    kwargs = {}
-    if selector.name and not selector.regex_name:
-        kwargs["Name"] = selector.name
-    if selector.automation_id:
-        kwargs["AutomationId"] = selector.automation_id
-    if selector.class_name:
-        kwargs["ClassName"] = selector.class_name
-
-    ctype = getattr(auto, selector.control_type, None)
-    if ctype is None:
-        raise ViberError(f"Unknown control type {selector.control_type}")
-
-    # Regex name requires a search-and-filter approach.
-    if selector.regex_name and selector.name:
-        deadline = time.monotonic() + timeout
-        pat = re.compile(selector.name, re.IGNORECASE)
-        while time.monotonic() < deadline:
-            for c in parent.GetChildren():
-                try:
-                    if c.ControlTypeName == selector.control_type and pat.search(c.Name or ""):
-                        return c
-                except Exception:
-                    continue
-            time.sleep(0.1)
-        return None
-
-    el = ctype(searchFromControl=parent, **kwargs)
-    if el.Exists(timeout, 0.1):
-        return el
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = _search_one(parent, selector, recursive=recursive)
+        if result is not None:
+            return result
+        time.sleep(0.15)
     return None
 
 
-def _walk(element, depth=0, max_depth=4):
+def _search_one(parent, selector, recursive: bool = True, max_depth: int = 10, depth: int = 0):
+    try:
+        children = parent.GetChildren()
+    except Exception:
+        return None
+    for c in children:
+        if _matches(c, selector):
+            return c
+        if recursive and depth < max_depth:
+            r = _search_one(c, selector, recursive=True, max_depth=max_depth, depth=depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _find_all(parent, selector, recursive: bool = True, max_depth: int = 10):
+    """Find all descendants matching the selector."""
+    results = []
+    _collect(parent, selector, results, recursive=recursive, max_depth=max_depth)
+    return results
+
+
+def _collect(parent, selector, results, recursive: bool, max_depth: int, depth: int = 0):
+    try:
+        children = parent.GetChildren()
+    except Exception:
+        return
+    for c in children:
+        if _matches(c, selector):
+            results.append(c)
+        if recursive and depth < max_depth:
+            _collect(c, selector, results, recursive=True, max_depth=max_depth, depth=depth + 1)
+
+
+def _walk(element, depth=0, max_depth=8):
     """Yield (depth, element) for a UIA subtree (for --inspect)."""
     yield depth, element
     if depth >= max_depth:
@@ -110,6 +154,29 @@ def _walk(element, depth=0, max_depth=4):
             yield from _walk(c, depth + 1, max_depth)
     except Exception:
         return
+
+
+def _find_first_matching(element, needle, depth=0, max_depth=10):
+    """Depth-first search for any descendant whose ClassName or AutomationId
+    contains `needle` (case-insensitive). Returns the first match or None."""
+    needle_l = needle.lower()
+    try:
+        cn = (element.ClassName or "").lower()
+        aid = (element.AutomationId or "").lower()
+        if needle_l in cn or needle_l in aid:
+            return element
+    except Exception:
+        pass
+    if depth >= max_depth:
+        return None
+    try:
+        for c in element.GetChildren():
+            r = _find_first_matching(c, needle, depth + 1, max_depth)
+            if r is not None:
+                return r
+    except Exception:
+        return None
+    return None
 
 
 class ViberClient:
@@ -143,10 +210,29 @@ class ViberClient:
             self.attach()
 
     # ---- Inspection (debug) ------------------------------------------
-    def inspect(self):
+    def inspect(self, max_depth: int = 8):
+        """Dump the whole Viber window subtree to stdout."""
         self._ensure_attached()
-        print(f"Top-level children of Viber window ({self.window.Name!r}):")
-        for depth, el in _walk(self.window, max_depth=3):
+        print(f"Window: {self.window.Name!r} (max_depth={max_depth})")
+        for depth, el in _walk(self.window, max_depth=max_depth):
+            indent = "  " * depth
+            try:
+                print(f"{indent}- [{el.ControlTypeName}] name={el.Name!r} "
+                      f"automationId={el.AutomationId!r} class={el.ClassName!r}")
+            except Exception as e:
+                print(f"{indent}- <error: {e}>")
+
+    def inspect_subtree(self, needle: str, max_depth: int = 10):
+        """Find the first descendant whose class or automationId matches
+        `needle` (substring, case-insensitive) and dump that subtree only."""
+        self._ensure_attached()
+        root = _find_first_matching(self.window, needle)
+        if root is None:
+            print(f"No control found matching {needle!r}")
+            return
+        print(f"Subtree rooted at ClassName={root.ClassName!r} "
+              f"automationId={root.AutomationId!r}")
+        for depth, el in _walk(root, max_depth=max_depth):
             indent = "  " * depth
             try:
                 print(f"{indent}- [{el.ControlTypeName}] name={el.Name!r} "
@@ -155,42 +241,66 @@ class ViberClient:
                 print(f"{indent}- <error: {e}>")
 
     # ---- Conversations ------------------------------------------------
+    def _sidebar(self):
+        """Return the left-side SideBarContent pane, or None."""
+        return _find(self.window, SIDEBAR_CONTENT, timeout=2.0)
+
+    def _chat_stack(self):
+        """Return the right-side StackView (active chat pane), or None."""
+        return _find(self.window, CHAT_STACK, timeout=2.0)
+
+    def _extract_row_label(self, row) -> str:
+        """Pull the contact/group name out of a conversation row.
+        Viber doesn't set Name on the delegate itself, so we descend and pick
+        up the first non-empty TextControl."""
+        if row.Name:
+            return row.Name.splitlines()[0].strip()
+        # Walk children, pick first TextControl with text
+        try:
+            for depth, el in _walk(row, max_depth=6):
+                if el is row:
+                    continue
+                if el.ControlTypeName == "TextControl" and (el.Name or "").strip():
+                    return el.Name.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+        return ""
+
     def list_conversations(self) -> list[ViberConversation]:
         self._ensure_attached()
-        chat_list = _find(self.window, CONVERSATION_LIST)
-        if chat_list is None:
-            log.warning("Conversation list not found — check CONVERSATION_LIST selector")
+        sidebar = self._sidebar()
+        if sidebar is None:
+            log.warning("Sidebar not found — check SIDEBAR_CONTENT selector")
             return []
 
+        rows = _find_all(sidebar, CONVERSATION_ITEM, recursive=True, max_depth=6)
         convs: list[ViberConversation] = []
-        for item in chat_list.GetChildren():
-            if item.ControlTypeName != "ListItemControl":
+        for row in rows:
+            label = self._extract_row_label(row)
+            if not label:
                 continue
-            name = (item.Name or "").strip()
-            if not name:
-                continue
-            # First line of Name is usually the contact/group
-            primary = name.splitlines()[0].strip()
+            # Look for a numeric unread badge anywhere in the row subtree
             unread = 0
-            badge = _find(item, UNREAD_BADGE, timeout=0.1)
-            if badge and (badge.Name or "").strip().isdigit():
-                unread = int(badge.Name.strip())
-            convs.append(ViberConversation(name=primary, unread=unread))
+            badges = _find_all(row, UNREAD_BADGE, recursive=True, max_depth=6)
+            for b in badges:
+                try:
+                    unread = max(unread, int((b.Name or "").strip()))
+                except ValueError:
+                    continue
+            convs.append(ViberConversation(name=label, unread=unread))
         return convs
 
     def open_conversation(self, name: str) -> bool:
         self._ensure_attached()
-        chat_list = _find(self.window, CONVERSATION_LIST)
-        if chat_list is None:
+        sidebar = self._sidebar()
+        if sidebar is None:
             return False
+        rows = _find_all(sidebar, CONVERSATION_ITEM, recursive=True, max_depth=6)
         target = None
         lname = name.lower()
-        for item in chat_list.GetChildren():
-            if item.ControlTypeName != "ListItemControl":
-                continue
-            primary = (item.Name or "").splitlines()[0].strip().lower()
-            if primary == lname:
-                target = item
+        for row in rows:
+            if self._extract_row_label(row).lower() == lname:
+                target = row
                 break
         if target is None:
             log.warning("Conversation %r not found", name)
@@ -214,13 +324,16 @@ class ViberClient:
             return []
 
         time.sleep(0.3)  # let Viber render
-        msg_list = _find(self.window, MESSAGE_LIST)
+        stack = self._chat_stack() or self.window
+        msg_list = _find(stack, MESSAGE_LIST, timeout=1.5)
         if msg_list is None:
             log.warning("Message list not found — check MESSAGE_LIST selector")
             return []
 
-        items = [c for c in msg_list.GetChildren()
-                 if c.ControlTypeName == "ListItemControl"]
+        items = _find_all(msg_list, MESSAGE_ITEM, recursive=True, max_depth=4)
+        if not items:
+            # Fallback: any child control with a non-empty Name
+            items = [c for c in msg_list.GetChildren() if (c.Name or "").strip()]
         items = items[-limit:]  # most recent N
 
         messages: list[ViberMessage] = []
@@ -266,7 +379,8 @@ class ViberClient:
         self._ensure_attached()
         if not self.open_conversation(name):
             return False
-        inp = _find(self.window, INPUT_BOX)
+        stack = self._chat_stack() or self.window
+        inp = _find(stack, INPUT_BOX, timeout=1.5)
         if inp is None:
             log.error("Input box not found — check INPUT_BOX selector")
             return False
@@ -290,9 +404,25 @@ class ViberClient:
 # CLI inspection helper ----------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    if "--inspect" in sys.argv:
-        c = ViberClient({"window_title": "Viber"})
-        c.attach()
-        c.inspect()
+    c = ViberClient({"window_title": "Viber"})
+    c.attach()
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--inspect-subtree":
+        if len(argv) < 2:
+            print("usage: viber_client.py --inspect-subtree <classname-or-automationid-substring>")
+            sys.exit(1)
+        depth = int(argv[2]) if len(argv) > 2 else 10
+        c.inspect_subtree(argv[1], max_depth=depth)
+    elif argv and argv[0] == "--inspect":
+        depth = int(argv[1]) if len(argv) > 1 else 8
+        c.inspect(max_depth=depth)
     else:
-        print("Run with --inspect to dump the Viber UI tree.")
+        print("Usage:")
+        print("  python viber_client.py --inspect [max_depth=8]")
+        print("  python viber_client.py --inspect-subtree <needle> [max_depth=10]")
+        print()
+        print("Examples:")
+        print("  python viber_client.py --inspect 10")
+        print("  python viber_client.py --inspect-subtree SideBarContent")
+        print("  python viber_client.py --inspect-subtree StackView")

@@ -1,15 +1,21 @@
 #!/bin/bash
-# Register @viber:samprim.net on Synapse and obtain an access token.
-# Run on the DS218 over SSH.
+# Register @viber:example.com on Synapse and obtain an access token.
+# Run on your Synapse host over SSH.
 #
 # Usage:  sudo bash register-viber-user.sh <password>
 
 set -e
 
 PASSWORD="${1:?usage: register-viber-user.sh <password>}"
-HOMESERVER_YAML="/volume1/docker/matrix-homeserver/synapse/homeserver.yaml"
+# Adjust these for your setup:
+#   HOMESERVER_YAML = path inside the Synapse container (usually /data/homeserver.yaml)
+#   HOMESERVER_URL  = local Synapse URL (usually http://localhost:8008)
+#   PUBLIC_URL      = your public Matrix URL
+# Synology users typically find their homeserver.yaml at
+#   /volume1/docker/matrix-homeserver/synapse/homeserver.yaml on the host.
+HOMESERVER_YAML="/data/homeserver.yaml"
 HOMESERVER_URL="http://localhost:8008"
-PUBLIC_URL="https://matrix.samprim.net"
+PUBLIC_URL="https://matrix.example.com"
 
 echo "[1/2] Registering @viber on Synapse..."
 sudo docker exec -i synapse register_new_matrix_user \

@@ -21,12 +21,12 @@
                         │ UI Automation (pywinauto + uiautomation)
                         ▼
              ┌──────────────────────┐      matrix-nio      ┌────────────────────┐
-             │ viber-bridge.py      │ ◄──────────────────► │ Synapse on DS218   │
-             │ (Windows service)    │   @viber:samprim.net │ matrix.samprim.net │
+             │ viber-bridge.py      │ ◄──────────────────► │ Synapse on Synapse host   │
+             │ (Windows service)    │   @viber:example.com │ matrix.example.com │
              └──────────────────────┘                      └────────────────────┘
 ```
 
-- A dedicated Matrix user `@viber:samprim.net` posts & receives on your behalf
+- A dedicated Matrix user `@viber:example.com` posts & receives on your behalf
 - Each Viber conversation gets its own Matrix room (auto-created)
 - A bootstrap **control room** lets you run `!list`, `!pair`, `!status` commands
 - State (room ↔ conversation mappings, dedup cache) in a local SQLite DB
@@ -37,7 +37,7 @@
 viber-bridge/
 ├── README.md                           ← this file
 ├── matrix-setup/
-│   └── register-viber-user.sh          ← run on DS218 to create @viber user
+│   └── register-viber-user.sh          ← run on Synapse host to create @viber user
 ├── scripts/
 │   ├── config.example.yaml             ← copy to config.yaml and fill in
 │   ├── requirements.txt                ← Python deps
@@ -52,9 +52,9 @@ viber-bridge/
 
 ## Setup — Step by step
 
-### 1. Register the bridge user on Synapse (DS218)
+### 1. Register the bridge user on Synapse (Synapse host)
 
-SSH to the DS218 and run the helper script, or manually:
+SSH to the Synapse host and run the helper script, or manually:
 
 ```bash
 sudo docker exec -it synapse register_new_matrix_user \
@@ -69,28 +69,28 @@ Easy way to get a token with curl:
 
 ```bash
 curl -XPOST -d '{"type":"m.login.password","user":"viber","password":"<password>"}' \
-  https://matrix.samprim.net/_matrix/client/v3/login
+  https://matrix.example.com/_matrix/client/v3/login
 ```
 
-### 2. Invite `@viber:samprim.net` to a control room
+### 2. Invite `@viber:example.com` to a control room
 
-In Element (as `@sam.russell:samprim.net`):
+In Element (as `@admin:example.com`):
 1. Create a new **private** room named something like "Viber Control"
-2. Invite `@viber:samprim.net`
-3. Copy the room ID (Room Settings → Advanced → Internal room ID, looks like `!abc123:samprim.net`)
+2. Invite `@viber:example.com`
+3. Copy the room ID (Room Settings → Advanced → Internal room ID, looks like `!abc123:example.com`)
 4. Paste into `config.yaml` as `matrix.control_room_id`
 
 **Then accept the invite on the bridge user's behalf** — the @viber account has no UI, so you do it with a single API call. Use the helper:
 
 ```bash
-bash matrix-setup/accept-invite.sh '!abc123:samprim.net' 'syt_dmliZXI_xxx...'
+bash matrix-setup/accept-invite.sh '!abc123:example.com' 'syt_dmliZXI_xxx...'
 ```
 
 (You'll run this again for any future room you invite `@viber` into manually.)
 
 ### 3. Create the working folder on Windows
 
-On the Windows Media Server:
+On the Windows host:
 
 1. Create `C:\viber-bridge\`
 2. Copy **the contents of** `scripts/` into that folder (not the `scripts` folder itself) — so you end up with:
@@ -110,7 +110,7 @@ On the Windows Media Server:
 
    The service installer batch files assume this exact layout (`C:\viber-bridge\`). If you put things elsewhere, edit the paths inside `install-service.bat`.
 
-### 4. Install Viber Desktop on the Windows Media Server
+### 4. Install Viber Desktop on the Windows host
 
 - Download from [viber.com](https://www.viber.com/en/download/) and sign in with your phone number
 - Important: the bridge **must run in the same Windows user session** where Viber is signed in
@@ -159,9 +159,9 @@ python bridge.py --config config.yaml
 ```
 
 You should see:
-- `[matrix] connected as @viber:samprim.net`
+- `[matrix] connected as @viber:example.com`
 - `[viber] attached to Viber window`
-- `[control] posted ready message in !abc:samprim.net`
+- `[control] posted ready message in !abc:example.com`
 
 In the control room, try `!status` to confirm the bridge is responsive.
 
