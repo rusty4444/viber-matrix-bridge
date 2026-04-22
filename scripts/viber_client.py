@@ -146,21 +146,45 @@ def _collect(parent, selector, results, recursive: bool, max_depth: int, depth: 
             _collect(c, selector, results, recursive=True, max_depth=max_depth, depth=depth + 1)
 
 
+def _read_bounds_live(el, retries: int = 2, settle: float = 0.05) -> tuple[int, int, int, int] | None:
+    """Read BoundingRectangle, working around the known uiautomation quirk
+    where freshly-found proxies return (0,0,0,0) until their internal cache
+    is populated. See
+    https://github.com/yinkaisheng/Python-UIAutomation-for-Windows/issues/212
+
+    Strategy:
+      1. Read BoundingRectangle. If non-zero, return.
+      2. Call .Refind() to force the library to re-resolve the UIA element
+         from its stored condition. Re-read BoundingRectangle.
+      3. Retry a few times with a small sleep between attempts.
+
+    Returns (left, top, right, bottom) or None.
+    """
+    for attempt in range(retries + 1):
+        try:
+            r = el.BoundingRectangle
+            if r is not None:
+                l, t, rt, b = r.left, r.top, r.right, r.bottom
+                if rt - l > 0 and b - t > 0:
+                    return (l, t, rt, b)
+        except Exception:
+            pass
+        # Stale or uninitialized proxy — force refresh.
+        try:
+            el.Refind()
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(settle)
+    return None
+
+
 def _visible_bounds(el) -> tuple[int, int, int, int] | None:
     """Return (left, top, right, bottom) of el if it's actually rendered
     on screen (non-zero area). None if virtualized / off-screen / no bounds.
+    Uses _read_bounds_live so stale proxies get a Refind retry first.
     """
-    try:
-        r = el.BoundingRectangle
-        if r is None:
-            return None
-        # uiautomation's Rect has .left .top .right .bottom
-        l, t, rt, b = r.left, r.top, r.right, r.bottom
-        if rt - l <= 0 or b - t <= 0:
-            return None
-        return (l, t, rt, b)
-    except Exception:
-        return None
+    return _read_bounds_live(el)
 
 
 def _is_visible(el) -> bool:
@@ -625,18 +649,11 @@ class ViberClient:
                         # button at the top-left, a QQuickLoader that also
                         # carries AutomationId='delegateLoader').
                         continue
-                    try:
-                        b = ctrl.BoundingRectangle
-                    except Exception:
-                        b = None
-                    if b is None:
+                    bounds = _read_bounds_live(ctrl)
+                    if bounds is None:
                         continue
-                    bounds = (b.left, b.top, b.right, b.bottom)
                     w = bounds[2] - bounds[0]
                     h = bounds[3] - bounds[1]
-                    # Reject zero/negative area (virtualized / off-screen).
-                    if w <= 0 or h <= 0:
-                        continue
                     # Sidebar search-result row geometry: width ~280–340 px,
                     # height ~60–90 px. Be generous at the bounds.
                     if w < 200 or w > 400:
@@ -670,14 +687,8 @@ class ViberClient:
                             )
                             if not ctrl.Exists(0.0, 0):
                                 break
-                            try:
-                                b = ctrl.BoundingRectangle
-                            except Exception:
-                                b = None
-                            if b is None:
-                                continue
-                            bounds = (b.left, b.top, b.right, b.bottom)
-                            if bounds[2] - bounds[0] <= 0 or bounds[3] - bounds[1] <= 0:
+                            bounds = _read_bounds_live(ctrl)
+                            if bounds is None:
                                 continue
                             try:
                                 row_name = (ctrl.Name or "").strip()
@@ -1213,18 +1224,15 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
     # where re-reading BoundingRectangle returns zero-area rects.
     captured = []
     for rr in all_rows:
+        bn = _read_bounds_live(rr)
+        if bn is None:
+            continue
         try:
-            b = rr.BoundingRectangle
-            if b is None:
-                continue
-            bn = (b.left, b.top, b.right, b.bottom)
-            if bn[2] - bn[0] <= 0 or bn[3] - bn[1] <= 0:
-                continue
             cls = (rr.ClassName or "")
             nm  = (rr.Name or "").strip()
-            captured.append((rr, bn, cls, nm))
         except Exception:
-            continue
+            cls, nm = "", ""
+        captured.append((rr, bn, cls, nm))
     # dedup by (left, top)
     seen = set()
     unique = []
@@ -1253,8 +1261,8 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
                 if not ctrl.Exists(0.0, 0):
                     break
                 cls = (ctrl.ClassName or "")
-                b = ctrl.BoundingRectangle
-                bs = f"({b.left},{b.top},{b.right},{b.bottom})" if b else "no-rect"
+                bn = _read_bounds_live(ctrl)
+                bs = f"({bn[0]},{bn[1]},{bn[2]},{bn[3]})" if bn else "no-rect"
                 nm = (ctrl.Name or "").strip()
                 print(f"      [{i}] name={nm!r:20s} bounds={bs} cls={cls!r}")
             except Exception as e:
