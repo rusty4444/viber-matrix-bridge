@@ -1,10 +1,38 @@
 # Viber ↔ Matrix Bridge (Windows UI Automation)
 
-> ⚠️ **THEORY / UNTESTED — v0.0.1**
+> 🚧 **IN ACTIVE TESTING — NOT YET WORKING END-TO-END** 🚧
 >
-> This is a **first-draft design** for a Viber ↔ Matrix bridge. None of it has been run against a live Viber Desktop yet. The approach is sound, but the specific UI Automation selectors (`AutomationId`, `ClassName`, etc. in [`viber_selectors.py`](scripts/viber_selectors.py)) are **educated guesses** — they will almost certainly need tweaking once Viber Desktop is installed and inspected.
+> This is a work-in-progress attempt at a Viber ↔ Matrix bridge via Windows
+> UI Automation on Viber Desktop. **If you landed here from a search,
+> please read the caveats before assuming this works.**
 >
-> Plan is to try it end-to-end, report what breaks, then iterate on this repo. Issues and commits will track the actual state.
+> **Current status (last updated 22 April 2026):**
+> - ✅ Matrix user registered, control room set up (must be unencrypted — see [#9](../../issues/9))
+> - ✅ Viber Desktop window attach via Qt QML class (see [#6](../../issues/6))
+> - ✅ Typing into Viber's search box works
+> - ✅ Clicking the top search result opens the correct chat visually
+>   (after working around Qt UIA's lying bounding rectangles and recursive
+>   tree duplication — see [#10](../../issues/10))
+> - ❌ **Blocked:** after the click visibly opens the correct chat, UIA
+>   cannot find the StackView, input box, or any other sign of the active
+>   chat pane in the tree. Verification fails → bridge aborts → messages
+>   never get read (see [#11](../../issues/11), [#12](../../issues/12))
+>
+> **If you have experience with Qt QML accessibility / UI Automation on
+> Windows, suggestions very welcome** — open an issue. The Viber Desktop
+> UIA tree seems to hide or stub out most of the chat pane's descendants,
+> and neither waiting nor re-attaching the top-level window brings them
+> back. Possible avenues:
+>
+> - Using raw IAccessible (MSAA) instead of UIA
+> - Using Qt's built-in accessibility test tool / QQuickAccessibleFactory
+>   path to understand what's exposed
+> - Screen-scraping via OCR as a last resort
+> - Using a different automation backend (\`pywinauto.Application\`,
+>   \`comtypes\` directly) that might surface controls \`uiautomation\` misses
+>
+> For full history, see the issue tracker — every dead-end is recorded
+> there so no one repeats the same diagnosis.
 
 **Experimental** personal bridge for Viber by driving the Viber Desktop client with Windows UI Automation. Not a real mautrix bridge — this is a pragmatic workaround since Viber has no public client API.
 
