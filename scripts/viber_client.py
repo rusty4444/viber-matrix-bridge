@@ -730,44 +730,71 @@ class ViberClient:
     # click them, because the search box itself stays live and gives
     # us a reliable anchor.
     #
-    # Calibration source: a successful --inspect-chat run where both
-    # the search box and the search-result rows reported real bounds:
-    #   search box top           = 195
-    #   first search-result top  = 339   → offset +144 below search box
-    #   first normal-list top    = 276   → offset  +81 below search box
-    #   row height               ≈ 72 px
+    # The challenge: the pixel offset from the search box top to the
+    # first search-result row depends on Viber's window geometry, UI
+    # density settings, and whether contacts have profile pictures.
+    # A single hard-coded offset misaims on different window layouts.
     #
-    # These offsets are pixel-exact at the standard Windows DPI (100%)
-    # Viber uses by default. If Viber's UI is zoomed they'll drift; we
-    # log the computed click point so it can be recalibrated from a
-    # field log without another inspect run.
-    _SIDEBAR_SEARCH_RESULT_Y_OFFSET = 144
+    # Solution: MEASURE the offset from any successful UIA enumeration
+    # and cache it per instance. Every time _enumerate_search_delegates
+    # returns >=1 row with real bounds, we compute
+    #   offset = row_top - sb_top
+    # and store it on the client. Later blind-clicks (fired when UIA
+    # goes dead) use the cached value, which was measured from THIS
+    # session's actual UI.
+    #
+    # Defaults below are sane fallbacks for a fresh install that has
+    # never seen a successful enum yet. They match the values we've
+    # observed on a ~300 px tall grouped-section search result:
+    #   sb_top + 261 → first search-result row top (from 02:45 log)
+    # (row height ≈72 px for individual rows, up to ~305 px for grouped
+    # section delegates — either way the click target is the top third).
+    _SIDEBAR_SEARCH_RESULT_Y_OFFSET = 261
     _SIDEBAR_NORMAL_ROW_Y_OFFSET = 81
     _SIDEBAR_ROW_CENTER_Y_OFFSET = 36   # ~half a 72 px row
+
+    def _record_search_result_offset(self, sb, row_bounds: tuple) -> None:
+        """Remember the observed pixel offset from the search box to a
+        real search-result row. Used to recalibrate blind-click targets
+        for THIS window geometry on subsequent fallbacks.
+        """
+        sb_bnds = _read_bounds_live(sb)
+        if sb_bnds is None:
+            return
+        offset = row_bounds[1] - sb_bnds[1]
+        # Sanity: ignore offsets that can't be real (search results can't
+        # overlap the search box, and can't be a full screen away).
+        if offset < 40 or offset > 800:
+            return
+        if offset != self._SIDEBAR_SEARCH_RESULT_Y_OFFSET:
+            log.info("recalibrated search-result Y offset: %d → %d (this session)",
+                     self._SIDEBAR_SEARCH_RESULT_Y_OFFSET, offset)
+            self._SIDEBAR_SEARCH_RESULT_Y_OFFSET = offset
 
     def _blind_click_top_search_result(self, sb) -> bool:
         """Click the topmost search-result slot relative to the search
         box's live bounds. Used when UIA enumeration returns 0 rows.
 
-        Returns True if the click was issued, False if we couldn't even
-        read the anchor bounds.
+        Uses the session-learned ``_SIDEBAR_SEARCH_RESULT_Y_OFFSET``
+        which is recalibrated whenever UIA enum succeeds at least once
+        in this process. Returns True if the click was issued, False
+        if we couldn't even read the anchor bounds.
         """
         bnds = _read_bounds_live(sb)
         if bnds is None:
             log.error("blind-click: search box has no bounds; cannot anchor")
             return False
         sb_l, sb_t, sb_r, _sb_b = bnds
-        # 10 px inside the sidebar column (sidebar's left edge aligns
-        # with or slightly left of the search box); vertical center of
-        # the first result row.
+        # Click inside the sidebar column at the first result row.
         cx = sb_l + 10
         cy = (sb_t
               + self._SIDEBAR_SEARCH_RESULT_Y_OFFSET
               + self._SIDEBAR_ROW_CENTER_Y_OFFSET)
         log.warning("UIA enumeration dead — blind-clicking top search "
-                    "result at (%d,%d), anchored to search box "
-                    "bounds=(%d,%d,%d,%d)",
-                    cx, cy, sb_l, sb_t, sb_r, bnds[3])
+                    "result at (%d,%d) [sb_top=%d + offset=%d + center=%d]",
+                    cx, cy, sb_t,
+                    self._SIDEBAR_SEARCH_RESULT_Y_OFFSET,
+                    self._SIDEBAR_ROW_CENTER_Y_OFFSET)
         try:
             auto.Click(cx, cy, waitTime=0.1)
             return True
@@ -1062,11 +1089,17 @@ class ViberClient:
                             continue
                         w = bounds[2] - bounds[0]
                         h = bounds[3] - bounds[1]
-                        # Sidebar search-result row geometry: width
-                        # ~280–340 px, height ~60–90 px. Be generous.
+                        # Sidebar delegate geometry: width ~280–340 px.
+                        # Height varies widely: individual-contact rows are
+                        # ~60–90 px, but Viber also renders "section"
+                        # delegates (Conversations/Contacts/Channels headers
+                        # plus their grouped rows) as a single delegate
+                        # ~300 px tall. Both are valid click targets, so
+                        # we accept a wide height range and rely on the
+                        # name-match scoring below to pick the right one.
                         if w < 200 or w > 400:
                             continue
-                        if h < 40 or h > 200:
+                        if h < 40 or h > 600:
                             continue
                         try:
                             row_name = (ctrl.Name or "").strip()
@@ -1188,6 +1221,11 @@ class ViberClient:
                              idx, row_name[:40], row_aid[:30],
                              bnds[0], bnds[1], bnds[2], bnds[3], bnds[3] - bnds[1],
                              cls[:50])
+                # Recalibrate the blind-click Y offset from the topmost
+                # row we just captured with real bounds. Next time UIA
+                # goes dead, the fallback will click at this session's
+                # actual search-result position instead of a stale value.
+                self._record_search_result_offset(search, unique[0][1])
 
             # Pick strategy, best-first (all operate on cached row_name):
             #   1. Exact case-insensitive Name match
