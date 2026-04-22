@@ -496,20 +496,23 @@ class ViberClient:
                 for i in range(len(rows))]
 
     def _clear_search_if_open(self):
-        """If the top search box has text in it, Viber hides the chat pane
-        and shows search results instead — FeedDelegates in the chat are
-        either not in the UIA tree or occluded. Clear it defensively before
-        any read/navigate op.
+        """If the top search box has text, Viber hides the chat pane behind
+        search results and our FeedDelegate enumeration fails.
 
-        Uses keyboard only (Esc + Ctrl+A + Delete + Esc) — no UIA clicks,
-        because clicking the search box and clearing it from UIA causes
-        Qt's accessibility tree to rebuild (see issue #15).
+        CRITICAL: do NOT click the search box to clear it. Clicking it focuses
+        the search field and steals focus from the chat pane; Viber then
+        won't enumerate the chat's FeedDelegates and a subsequent search
+        starts from a broken state (observed: search returns 0 rows on the
+        next call).
+
+        Instead: send a global {Esc} via the window handle. Viber's search
+        widget collapses on Esc and returns focus to the previously-active
+        chat. If the search box is already empty, this is a no-op.
         """
         try:
             search = self._search_box()
             if search is None:
                 return
-            # Read the current value. If empty, nothing to do.
             current = ""
             try:
                 vp = search.GetValuePattern()
@@ -518,17 +521,22 @@ class ViberClient:
                 current = ""
             if not current.strip():
                 return
-            log.info("clearing stale search text %r before op", current[:40])
-            # Focus the search box, clear, then Esc to dismiss search mode.
+            log.info("clearing stale search text %r with global Esc", current[:40])
+            # Global Esc — routed to whatever currently has keyboard focus in
+            # the Viber window. This collapses the search results and
+            # restores the chat pane without us ever focusing the search box.
             try:
-                search.Click(simulateMove=False)
-                time.sleep(0.1)
-                auto.SendKeys("{Ctrl}a", waitTime=0.05)
-                auto.SendKeys("{Delete}", waitTime=0.05)
                 auto.SendKeys("{Esc}", waitTime=0.15)
-                time.sleep(0.4)
+                time.sleep(0.3)
+                # Verify cleared. If Esc alone didn't clear (some Viber builds
+                # only dismiss autocomplete on first Esc), try once more.
+                vp2 = search.GetValuePattern()
+                still = (vp2.Value or "") if vp2 is not None else ""
+                if still.strip():
+                    auto.SendKeys("{Esc}", waitTime=0.15)
+                    time.sleep(0.3)
             except Exception as e:
-                log.debug("clear_search keyboard sequence failed: %s", e)
+                log.debug("clear_search Esc failed: %s", e)
         except Exception as e:
             log.debug("_clear_search_if_open error: %s", e)
 
@@ -563,9 +571,10 @@ class ViberClient:
         self._ensure_attached()
         self._focus_window()
         time.sleep(0.1)
-        # Belt-and-braces: if a previous failed addchat left residual
-        # search text, the first keystroke below would append to it.
-        self._clear_search_if_open()
+        # Note: do NOT call _clear_search_if_open() here. This function's
+        # own "click search + Ctrl+A + Delete + paste" below already clears
+        # any residual text. Adding a pre-clear was observed to break the
+        # subsequent search (returning 0 rows) because of focus churn.
 
         search = self._search_box()
         if search is None:
@@ -637,20 +646,83 @@ class ViberClient:
                           "name didn't match anything.", name)
                 return False
 
-            # Click the topmost visible row. IMPORTANT: we cannot use the
-            # UIA control's default center click — Qt reports each row's
-            # height as the full viewport-remaining height (e.g. 870px), so
-            # "center" lands several rows below the actual item. Click near
-            # the top-left of the reported bounds instead.
-            target = visible_rows[0]
+            # Log every visible row's name/class/geometry. Viber groups
+            # search results into sections: Conversations (top), Contacts,
+            # Channels. We want the row under 'Conversations' whose Name
+            # matches the query — that's the already-paired chat history.
+            # Clicking any other section row either opens a new
+            # contact/channel view or a section header (no chat).
+            def _row_name(c):
+                try:
+                    return (c.Name or "").strip()
+                except Exception:
+                    return ""
+            def _row_aid(c):
+                try:
+                    return (c.AutomationId or "").strip()
+                except Exception:
+                    return ""
+            def _row_height(c):
+                b = c.BoundingRectangle
+                return b.bottom - b.top
+            def _row_top(c):
+                return c.BoundingRectangle.top
+
+            for i, rr in enumerate(visible_rows):
+                try:
+                    br = rr.BoundingRectangle
+                    log.info("  row[%d] name=%r aid=%r bounds=(%d,%d,%d,%d) h=%d",
+                             i, _row_name(rr)[:40], _row_aid(rr)[:30],
+                             br.left, br.top, br.right, br.bottom,
+                             br.bottom - br.top)
+                except Exception:
+                    pass
+
+            # Pick strategy, best-first:
+            #   1. Row whose Name exactly case-insensitively equals the query
+            #      AND has a sane height (40–200px).
+            #   2. Row whose Name starts with the query (same sane height).
+            #   3. Row whose Name contains the query (same sane height).
+            #   4. Topmost sane-height row (current behaviour).
+            #   5. Shortest row (avoids the full-viewport container delegate).
+            query_lc = name.strip().lower()
+            def sane(r):
+                h = _row_height(r)
+                return 40 <= h <= 200
+            sane_rows = [r for r in visible_rows if sane(r)]
+            target = None
+            pick_reason = ""
+            for pred, label in [
+                (lambda r: _row_name(r).lower() == query_lc, "exact-name match"),
+                (lambda r: _row_name(r).lower().startswith(query_lc), "name-prefix match"),
+                (lambda r: query_lc in _row_name(r).lower(), "name-substring match"),
+            ]:
+                matches = [r for r in sane_rows if pred(r)]
+                if matches:
+                    matches.sort(key=_row_top)
+                    target = matches[0]
+                    pick_reason = label
+                    break
+            if target is None:
+                if sane_rows:
+                    sane_rows.sort(key=_row_top)
+                    target = sane_rows[0]
+                    pick_reason = "topmost sane-height row (no name match)"
+                else:
+                    log.warning("no row with sane height 40–200px after search %r; "
+                                "falling back to shortest of %d visible rows",
+                                name, len(visible_rows))
+                    target = min(visible_rows, key=_row_height)
+                    pick_reason = "shortest fallback row"
+
             r = target.BoundingRectangle
-            # (left + 50, top + 30) reliably hits the avatar / name area of
-            # a Viber list row.
+            # Click near the top-left of the picked row (avatar/name area).
             click_x = r.left + 50
-            click_y = r.top + 30
-            log.info("clicking search result at screen (%d,%d) "
-                     "[row reports bounds=(%d,%d,%d,%d)]",
-                     click_x, click_y, r.left, r.top, r.right, r.bottom)
+            click_y = r.top + min(30, max(10, (r.bottom - r.top) // 3))
+            log.info("clicking search result at screen (%d,%d) [picked=%r "
+                     "reason=%s bounds=(%d,%d,%d,%d) h=%d]",
+                     click_x, click_y, _row_name(target)[:40], pick_reason,
+                     r.left, r.top, r.right, r.bottom, r.bottom - r.top)
             try:
                 auto.Click(click_x, click_y, waitTime=0.1)
             except Exception as e:
