@@ -202,32 +202,36 @@ def _native_find(parent, control_type_name: str, class_name: str,
 
 
 def _native_find_all(parent, control_type_name: str, class_name_regex: str,
-                    search_depth: int = 20):
-    """Find ALL descendants matching a regex class name via uiautomation's
-    GetDescendantControls with a Python predicate.
+                    search_depth: int = 20, max_count: int = 50):
+    """Find all descendants matching a regex class name.
 
-    Unlike _find_all, this uses uiautomation's tree walker which is more
-    reliable right after UI transitions.
+    Uses ``auto.<ControlType>(searchFromControl=..., foundIndex=N)`` which
+    internally calls ``IUIAutomation::FindFirst`` once per index. This
+    reliably returns multiple results (unlike GetDescendantControls which
+    doesn't exist in uiautomation 2.0.x).
+
+    Note: ClassName regex matching isn't supported by UIA's native search,
+    so we pull by ControlType only and filter class names in Python.
     """
     if auto is None:
         return []
-    pat = re.compile(class_name_regex)
-    try:
-        def pred(c):
-            try:
-                if c.ControlTypeName != control_type_name:
-                    return False
-                return bool(pat.search(c.ClassName or ""))
-            except Exception:
-                return False
-        if hasattr(parent, "GetDescendantControls"):
-            return parent.GetDescendantControls(pred) or []
-        # Fallback: single descendant lookup
-        one = parent.GetDescendantControl(pred) if hasattr(parent, "GetDescendantControl") else None
-        return [one] if one else []
-    except Exception as e:
-        log.debug("_native_find_all failed: %s", e)
+    ctype = getattr(auto, control_type_name, None)
+    if ctype is None:
         return []
+    pat = re.compile(class_name_regex)
+    out = []
+    for i in range(1, max_count + 1):
+        try:
+            ctrl = ctype(searchFromControl=parent, foundIndex=i,
+                         searchDepth=search_depth)
+            if not ctrl.Exists(0.0, 0):
+                break
+            cls = ctrl.ClassName or ""
+            if pat.search(cls):
+                out.append(ctrl)
+        except Exception:
+            break
+    return out
 
 
 def _dedup_by_position(controls):
@@ -574,15 +578,28 @@ class ViberClient:
                 log.error("Click at (%d,%d) failed: %s", click_x, click_y, e)
                 return False
 
-            # Give Viber time to swap search UI out and paint the chat.
-            # Qt's UIA tree can lag the visible UI by a second or two after a
-            # mode change (search -> chat), so we retry patiently.
-            post_click_wait = max(self.cfg.get("click_pause_ms", 1000), 1000) / 1000.0
-            time.sleep(post_click_wait)
+            # Let the click register
+            time.sleep(0.4)
 
-            # DO NOT re-attach the window: our self.window reference is still
-            # valid, and re-attaching causes its own timing issues. We rely
-            # on UIA's native FindFirst for freshness instead.
+            # CRITICAL: clear search BEFORE trying to verify that the chat
+            # opened. Viber keeps the search bar active after clicking a
+            # result — the StackView/chat controls are only restored to
+            # the UIA tree once search mode is fully dismissed.
+            try:
+                # Escape usually exits search mode
+                auto.SendKeys("{Esc}", waitTime=0.1)
+                time.sleep(0.2)
+                # Also explicitly clear the search box in case Escape didn't
+                search.Click(simulateMove=False)
+                auto.SendKeys("{Ctrl}a", waitTime=0.05)
+                auto.SendKeys("{Delete}", waitTime=0.1)
+                auto.SendKeys("{Esc}", waitTime=0.1)
+            except Exception as e:
+                log.debug("clearing search after click: %s", e)
+
+            # Give Viber time to exit search mode and restore the chat pane
+            # in the UIA tree.
+            time.sleep(0.8)
 
             # Look for ANY of: the active-chat StackView, OR the message input
             # box (QQuickTextEdit), OR a FeedDelegate (message bubble). Any of
@@ -622,27 +639,14 @@ class ViberClient:
             )
             if not chat_is_open:
                 log.error(
-                    "Chat didn't open within 5s. Neither StackView nor a "
-                    "visible message input was found. If Viber's right pane "
-                    "shows a Channel viewer or 'info' panel, the top search "
-                    "result wasn't a real Conversation."
+                    "Chat didn't open within 6s. None of StackView, visible "
+                    "input box, or FeedDelegate found after clearing search. "
+                    "If Viber's right pane shows a Channel viewer or 'info' "
+                    "panel, the top search result wasn't a real Conversation."
                 )
                 return False
             log.info("chat opened successfully (stack=%s, input=%s, feed=%s)",
                      bool(stack), bool(input_box), bool(feed))
-
-            # Only NOW clear the search, once we know we're in the chat
-            try:
-                search.Click(simulateMove=False)
-                auto.SendKeys("{Ctrl}a", waitTime=0.05)
-                auto.SendKeys("{Delete}", waitTime=0.05)
-            except Exception:
-                pass
-            # Click back into the chat pane so next keystrokes go to input
-            try:
-                stack.Click(simulateMove=False)
-            except Exception:
-                pass
             return True
         except Exception as e:
             log.error("open_conversation_by_search(%r) failed: %s", name, e)
