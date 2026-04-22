@@ -48,6 +48,11 @@ class MatrixClient:
         self.control_room = cfg["control_room_id"]
         self.admin = cfg["admin_user_id"]
         self._started_at: Optional[float] = None
+        # Skip-history threshold (Unix ms). Initialised here so the callback
+        # never AttributeErrors even if an event fires before start() finishes.
+        # Overwritten in start() with a tighter value just before sync.
+        import time as _time
+        self._start_ms = int(_time.time() * 1000)
 
     # ---- Lifecycle ---------------------------------------------------
     async def start(self):
@@ -61,6 +66,11 @@ class MatrixClient:
         self.client.access_token = self.cfg["access_token"]
         self.client.user_id = self.cfg["user_id"]
         self.client.device_id = self.cfg.get("device_id")
+
+        # Refresh start-time threshold to just before sync so any event the
+        # initial sync delivers is correctly classified as historical.
+        import time as _time
+        self._start_ms = int(_time.time() * 1000)
 
         # Register message handler
         self.client.add_event_callback(self._on_event, RoomMessageText)
