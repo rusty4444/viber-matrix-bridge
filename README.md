@@ -1,38 +1,47 @@
 # Viber ↔ Matrix Bridge (Windows UI Automation)
 
-> 🚧 **IN ACTIVE TESTING — NOT YET WORKING END-TO-END** 🚧
+> 🟡 **WORKING IN LIMITED MODE — STILL BEING SHAKEN OUT** 🟡
 >
-> This is a work-in-progress attempt at a Viber ↔ Matrix bridge via Windows
-> UI Automation on Viber Desktop. **If you landed here from a search,
-> please read the caveats before assuming this works.**
+> A personal Viber ↔ Matrix bridge that drives Viber Desktop via Windows
+> UI Automation. **If you landed here from a search: this works for one
+> person on one Viber build; do not assume it will on yours. Read the
+> caveats.**
 >
 > **Current status (last updated 22 April 2026):**
-> - ✅ Matrix user registered, control room set up (must be unencrypted — see [#9](../../issues/9))
+>
+> Working:
+> - ✅ Matrix user registered, unencrypted control room set up (see [#9](../../issues/9))
 > - ✅ Viber Desktop window attach via Qt QML class (see [#6](../../issues/6))
-> - ✅ Typing into Viber's search box works
-> - ✅ Clicking the top search result opens the correct chat visually
->   (after working around Qt UIA's lying bounding rectangles and recursive
->   tree duplication — see [#10](../../issues/10))
-> - ❌ **Blocked:** after the click visibly opens the correct chat, UIA
->   cannot find the StackView, input box, or any other sign of the active
->   chat pane in the tree. Verification fails → bridge aborts → messages
->   never get read (see [#11](../../issues/11), [#12](../../issues/12))
+> - ✅ Typing into Viber's search box
+> - ✅ Search-result row enumeration via `AutomationId=delegateLoader` + class prefix `ListViewDelegateLoader_QMLTYPE_465_*` + sidebar-geometry filter (robust across Viber QML-type suffix bumps — see [#20](../../issues/20), [#21](../../issues/21), [#23](../../issues/23))
+> - ✅ Bounding-rectangle reads stabilised via `.Refind()` retry — works around the known `uiautomation` library bug where fresh proxies return `(0,0,0,0)` (see [#23](../../issues/23))
+> - ✅ Chat-open verification after click (StackView or FeedDelegate, with right-pane click to knock Viber out of hybrid search+chat mode)
+> - ✅ Reading message bubbles (all UIA text patterns: Name / Value / Text / LegacyIAccessible)
+> - ✅ Geometry-based outgoing-message detection (bubble offset from chat-pane midpoint) — no longer depends on unreliable `FeedDelegate` direction hints
+> - ✅ Echo suppression via content hash + single-shot consume (so a legitimate reply with the same text still gets through after the echo is dropped — see [#17](../../issues/17))
+> - ✅ Matrix → Viber send to a paired chat
+> - ✅ Manual `!readhere` / `!pairhere` workflow for the most reliable pairing (you navigate in Viber; bridge reads what's open)
+> - ✅ Opt-in `!poll` loop with 30 s minimum interval + global asyncio lock so polling never races user commands (see [#8](../../issues/8))
 >
-> **If you have experience with Qt QML accessibility / UI Automation on
-> Windows, suggestions very welcome** — open an issue. The Viber Desktop
-> UIA tree seems to hide or stub out most of the chat pane's descendants,
-> and neither waiting nor re-attaching the top-level window brings them
-> back. Possible avenues:
+> Partially working / needs more testing:
+> - 🟡 `!addchat <name>` — search-and-click pairing. Recently fixed (see [#20](../../issues/20)/[#21](../../issues/21)/[#23](../../issues/23)); currently under shake-out for single-word and multi-word contact names.
+> - 🟡 Incoming Viber → Matrix message pickup. Works via `!readhere` on demand. Continuous pickup requires `!poll on` (see below); that path needs more live runtime before I trust it.
 >
-> - Using raw IAccessible (MSAA) instead of UIA
-> - Using Qt's built-in accessibility test tool / QQuickAccessibleFactory
->   path to understand what's exposed
-> - Screen-scraping via OCR as a last resort
-> - Using a different automation backend (\`pywinauto.Application\`,
->   \`comtypes\` directly) that might surface controls \`uiautomation\` misses
+> Not yet done:
+> - ❌ Media (images, files, stickers, reactions) — text only
+> - ❌ Reliable handling of Viber auto-updates that shift class names (current code is suffix-agnostic for `ListViewDelegateLoader_QMLTYPE_465_*` but not for every selector)
+> - ❌ Windows service install is untested after the recent round of fixes
 >
-> For full history, see the issue tracker — every dead-end is recorded
-> there so no one repeats the same diagnosis.
+> For full history including every dead-end, see the issue tracker.
+
+### Recommended workflow
+
+1. **Pair chats first, with polling OFF.** Open Viber manually so it's focused, then in the control room run `!addchat <name>` for each contact or group you want to bridge. If `!addchat` misbehaves for a given contact, open that chat manually in Viber and run `!pairhere <name>` instead — it's the most reliable path because you pick the chat, the bridge just reads what's open.
+2. **Turn polling on only after chats are paired** — `!poll on` in the control room. Polling navigates to every paired chat each cycle (minimum 30 s) and **steals Viber focus** while it does so. With no pairings, there's nothing to poll. Enabling it before pairing chats only adds noise.
+3. Matrix → Viber send works regardless of `!poll` state, because it's event-driven off your Matrix message.
+4. Incoming Viber → Matrix needs `!poll on`, OR you can run `!readhere` manually while a chat is open to flush its recent messages into the paired Matrix room.
+
+`!poll status` reports the current toggle. `!poll off` disables and the loop goes idle (no navigation, no focus theft) until re-enabled or the bridge is restarted. The toggle is runtime-only — set `bridge.poll_enabled: true` in `config.yaml` if you want it on across restarts.
 
 **Experimental** personal bridge for Viber by driving the Viber Desktop client with Windows UI Automation. Not a real mautrix bridge — this is a pragmatic workaround since Viber has no public client API.
 
@@ -225,32 +234,44 @@ To remove: `uninstall-service.bat`.
 | `!status` | Uptime, Viber attachment state, number of paired chats |
 | `!list` | List currently paired chats |
 | `!scan` | Count of visible conversation rows (names are not readable — see below) |
-| `!addchat <viber name>` | Navigate to a Viber chat by name; create & pair a new Matrix room if found |
-| `!pair <!room_id> <viber name>` | Pair an existing Matrix room to a Viber chat manually |
+| `!readhere` | Read the last few messages from the chat currently open in Viber (diagnostic; does not create a pairing) |
+| `!pairhere <viber name>` | Pair the chat currently open in Viber to a new Matrix room — **most reliable**, you navigate in Viber, bridge reads what's open |
+| `!addchat <viber name>` | Search for a Viber chat by name, click the top match, then pair a new Matrix room. Can fail if UIA misbehaves on the target build — fall back to `!pairhere` |
+| `!pair <!room_id> <viber name>` | Pair an existing Matrix room to a Viber chat manually (no Viber interaction) |
 | `!unpair <viber name>` | Remove a pairing |
-| `!test <viber name>` | Open a chat and read the last 5 messages (diagnostic) |
+| `!test <viber name>` | Open a chat by search and read the last 5 messages (diagnostic) |
+| `!poll on\|off\|status` | Toggle the incoming-message poll loop at runtime (default OFF; 30 s minimum interval; not persistent across restarts) |
 | `!reload` | Re-attach to the Viber window |
 
 ### Why you have to pair chats explicitly
 
 Viber Desktop is a Qt/QML app. Its conversation-row controls expose no
-contact name or children to Windows UI Automation — we can see that 4 rows
-exist, but not who each row represents. So the bridge can't "auto-discover
- unread chats" the way a real mautrix bridge does.
+contact name or children to Windows UI Automation — we can see that N rows
+exist in the sidebar, but not who each row represents. So the bridge can't
+"auto-discover unread chats" the way a real mautrix bridge does.
 
-Instead, you tell the bridge about each chat you want to bridge:
+Instead, you tell the bridge about each chat you want to bridge. Two paths:
 
-1. `!addchat Alice` — bridge types "Alice" into Viber's search box, clicks
-   the first matching result, and if that works, creates a Matrix room for
-   that chat.
-2. From then on, the bridge polls that specific chat every few seconds by
-   searching for its name again.
+1. **`!pairhere <name>`** (recommended). Open the chat manually in Viber,
+   then run this command. The bridge reads the messages currently on
+   screen and creates a Matrix room for them. Zero UIA navigation needed
+   on the bridge side, so this is the least fragile.
+2. **`!addchat <name>`**. The bridge types the name into Viber's search
+   box, enumerates the result rows, clicks the best match, verifies the
+   chat opened, and creates a Matrix room. Relies on a lot of UIA
+   cooperation — works on most Viber builds but can break on new ones.
+
+Once a chat is paired:
+- **Matrix → Viber** send works immediately (event-driven).
+- **Viber → Matrix** pickup requires `!poll on` (OFF by default because
+  polling steals Viber focus each cycle), or run `!readhere` manually
+  while the chat is open to flush recent messages.
 
 ## Limits & caveats (read these)
 
 - **Text only** in v1. No images, files, stickers, or reactions.
 - **No encryption.** Per-chat rooms are unencrypted (consistent with your other bridges).
-- **Echo suppression is best-effort.** If you send from your phone, the bridge will likely forward it back — dedup is by content+time hash with a 30-second window.
+- **Echo suppression** uses a content hash (sender-independent) plus a single-shot consume: when you send from Matrix, the bridge records the content hash; the next time that exact text appears in the paired Viber chat, it's dropped once. If the peer legitimately replies with the same text, only the first occurrence (your echo) is dropped — subsequent identical messages get through. Messages you type from Viber Desktop or your phone still forward into Matrix as normal.
 - **One Viber client per account.** Viber only allows one Desktop session; if you open Viber on another PC, this one logs out.
 - **Fragile.** Any Viber Desktop update can shift the UI tree and require selector tweaks.
 - **Greyzone.** Automating Viber Desktop is not officially supported. For personal use it's fine, but don't scale this.
