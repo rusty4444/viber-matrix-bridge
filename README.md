@@ -1,36 +1,56 @@
 # Viber ↔ Matrix Bridge (Windows UI Automation)
 
-> 🟡 **WORKING IN LIMITED MODE — STILL BEING SHAKEN OUT** 🟡
+> 🔴 **NO LONGER ACTIVELY MAINTAINED** 🔴
 >
-> A personal Viber ↔ Matrix bridge that drives Viber Desktop via Windows
-> UI Automation. **If you landed here from a search: this works for one
-> person on one Viber build; do not assume it will on yours. Read the
-> caveats.**
+> This was a personal Viber ↔ Matrix bridge that drives Viber Desktop via
+> Windows UI Automation. I've stopped active development. The bridge
+> works in very specific configurations but breaks often, and several of
+> the failure modes are not 100% reproducible, which makes them hard to
+> diagnose — each Viber auto-update or window-geometry change can
+> invalidate the class-name prefixes and pixel offsets the code relies
+> on. The code, issue tracker, and commit history are left up as a
+> reference for anyone who wants to pick up where I left off.
 >
-> **Current status (last updated 22 April 2026):**
+> **If this is useful to you:**
+> - **Fork it** and take it in whatever direction fits your setup — no
+>   attribution required, but a link back helps others find the
+>   archaeology.
+> - **Pull requests are welcome** and I'll review them as time allows,
+>   but I am not committing to a response SLA.
+> - **Get in touch** via a GitHub issue if you want to talk through the
+>   tricky bits (Qt accessibility zero-rects, the two-step search-click
+>   misroute, echo suppression, etc.) before diving in — I'd rather save
+>   someone else a week of dead ends.
 >
-> Working:
-> - ✅ Matrix user registered, unencrypted control room set up (see [#9](../../issues/9))
-> - ✅ Viber Desktop window attach via Qt QML class (see [#6](../../issues/6))
-> - ✅ Typing into Viber's search box
-> - ✅ Search-result row enumeration via `AutomationId=delegateLoader` + class prefix `ListViewDelegateLoader_QMLTYPE_465_*` + sidebar-geometry filter (robust across Viber QML-type suffix bumps — see [#20](../../issues/20), [#21](../../issues/21), [#23](../../issues/23))
-> - ✅ Bounding-rectangle reads stabilised via `.Refind()` retry — works around the known `uiautomation` library bug where fresh proxies return `(0,0,0,0)` (see [#23](../../issues/23))
-> - ✅ Chat-open verification after click (StackView or FeedDelegate, with right-pane click to knock Viber out of hybrid search+chat mode)
-> - ✅ Reading message bubbles (all UIA text patterns: Name / Value / Text / LegacyIAccessible)
-> - ✅ Geometry-based outgoing-message detection (bubble offset from chat-pane midpoint) — no longer depends on unreliable `FeedDelegate` direction hints
-> - ✅ Echo suppression via content hash + single-shot consume (so a legitimate reply with the same text still gets through after the echo is dropped — see [#17](../../issues/17))
+> **What worked when I stopped:**
+> - ✅ Matrix user registration and control-room setup
+> - ✅ Viber Desktop window attach via Qt QML class
+> - ✅ Typing into Viber's search box; search-result row enumeration
+>   via `AutomationId=delegateLoader` + class-prefix match
+> - ✅ `.Refind()` retry for the known `uiautomation` zero-rect bug
+> - ✅ Chat-open verification (StackView / FeedDelegate / input box)
+> - ✅ Reading message bubbles across all UIA text patterns
+> - ✅ Geometry-based outgoing-message detection
+> - ✅ Echo suppression via content hash + single-shot consume
 > - ✅ Matrix → Viber send to a paired chat
-> - ✅ Manual `!readhere` / `!pairhere` workflow for the most reliable pairing (you navigate in Viber; bridge reads what's open)
-> - ✅ Opt-in `!poll` loop with 30 s minimum interval + global asyncio lock so polling never races user commands (see [#8](../../issues/8))
+> - ✅ Manual `!readhere` / `!pairhere` workflow (the most reliable path)
+> - ✅ Opt-in `!poll` loop with global asyncio lock
 >
-> Partially working / needs more testing:
-> - 🟡 `!addchat <name>` — search-and-click pairing. Recently fixed (see [#20](../../issues/20)/[#21](../../issues/21)/[#23](../../issues/23)); currently under shake-out for single-word and multi-word contact names.
-> - 🟡 Incoming Viber → Matrix message pickup. Works via `!readhere` on demand. Continuous pickup requires `!poll on` (see below); that path needs more live runtime before I trust it.
+> **Known flaky areas:**
+> - 🟡 `!addchat <name>` search-and-click pairing. Works most of the
+>   time but can silently pair a Matrix room to the wrong Viber chat
+>   when Qt's accessibility tree returns zero-rect bounds for sidebar
+>   delegates and the blind-click fallback misaims on a different
+>   window geometry. See issues [#32](../../issues/32) and
+>   [#33](../../issues/33) for the rabbit hole.
+> - 🟡 Continuous Viber → Matrix pickup via `!poll on` — usable, but
+>   long-running stability was never fully characterised.
+> - 🟡 QML class-name prefixes shift on Viber auto-updates; selectors
+>   are suffix-agnostic but not guaranteed future-proof.
 >
-> Not yet done:
+> **Not implemented:**
 > - ❌ Media (images, files, stickers, reactions) — text only
-> - ❌ Reliable handling of Viber auto-updates that shift class names (current code is suffix-agnostic for `ListViewDelegateLoader_QMLTYPE_465_*` but not for every selector)
-> - ❌ Windows service install is untested after the recent round of fixes
+> - ❌ Windows service install (code exists, not tested recently)
 >
 > For full history including every dead-end, see the issue tracker.
 
