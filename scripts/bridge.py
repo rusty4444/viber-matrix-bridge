@@ -226,10 +226,18 @@ class Bridge:
             except ViberError as e:
                 await self.matrix.send_notice(room_id, f"⚠️ Viber error: {e}")
 
-    async def _viber_call(self, fn, *fargs, **fkwargs):
-        """Run a (synchronous) Viber operation under the lock, off the event loop."""
+    async def _viber_call(self, fn, *fargs, timeout: float = 15.0, **fkwargs):
+        """Run a (synchronous) Viber operation under the lock, off the event loop.
+
+        The operation is wrapped with a timeout so a hung UIA call surfaces as
+        an error rather than blocking the lock indefinitely. Raises
+        asyncio.TimeoutError if the operation exceeds *timeout* seconds.
+        """
         async with self._viber_lock:
-            return await asyncio.to_thread(fn, *fargs, **fkwargs)
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn, *fargs, **fkwargs),
+                timeout=timeout,
+            )
 
     # ---- Control-room commands ---------------------------------------
     async def _on_control(self, cmd: str, args: list[str], sender: str) -> str | None:
@@ -278,6 +286,10 @@ class Bridge:
             existing = await self.state.get_room_for_viber(vname)
             if existing:
                 return f"already paired: {vname!r} → {existing}"
+            await self.matrix.send_text(
+                self.cfg["matrix"]["control_room_id"],
+                f"⏳ Searching Viber for {vname!r}...",
+            )
             opened = await self._viber_call(self.viber.open_conversation_by_search, vname)
             if not opened:
                 return f"could not find a Viber chat matching {vname!r}"
@@ -315,6 +327,10 @@ class Bridge:
             if not args:
                 return "usage: !test <viber contact or group name>"
             vname = " ".join(args)
+            await self.matrix.send_text(
+                self.cfg["matrix"]["control_room_id"],
+                f"⏳ Opening Viber chat {vname!r}...",
+            )
             try:
                 opened = await self._viber_call(self.viber.open_conversation_by_search, vname)
                 if not opened:
