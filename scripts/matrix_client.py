@@ -47,6 +47,7 @@ class MatrixClient:
         self.client: Optional[AsyncClient] = None
         self.control_room = cfg["control_room_id"]
         self.admin = cfg["admin_user_id"]
+        self._admin_rejection_logged: bool = False   # one-shot INFO on misconfig
         self._started_at: Optional[float] = None
         # Skip-history threshold (Unix ms). Initialised here so the callback
         # never AttributeErrors even if an event fires before start() finishes.
@@ -80,6 +81,15 @@ class MatrixClient:
         await self.client.sync(timeout=10000, full_state=True)
         log.info("connected as %s", self.client.user_id)
 
+        # Post a one-time notice identifying the expected admin user ID so
+        # misconfigured admin_user_id is immediately visible in the control room.
+        await self.send_notice(
+            self.control_room,
+            f"🔐 Control-room admin is set to: {self.admin}\n"
+            f"If this doesn't look right, update admin_user_id in config.yaml "
+            f"and restart the bridge.",
+        )
+
     async def stop(self):
         if self.client:
             await self.client.close()
@@ -108,8 +118,14 @@ class MatrixClient:
             return
         # Only accept from admin
         if event.sender != self.admin:
-            log.debug("ignoring message from non-admin %s (expected %s)",
-                      event.sender, self.admin)
+            if not self._admin_rejection_logged:
+                log.info("ignoring message from non-admin %s (expected admin %s) — "
+                         "update admin_user_id in config.yaml if this seems wrong",
+                         event.sender, self.admin)
+                self._admin_rejection_logged = True
+            else:
+                log.debug("ignoring message from non-admin %s (expected %s)",
+                          event.sender, self.admin)
             return
 
         body = (event.body or "").strip()
