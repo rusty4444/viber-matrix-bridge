@@ -302,3 +302,5 @@ Once a chat is paired:
 - **Service starts but nothing happens** → NSSM is probably running as SYSTEM, not your user. Reinstall service interactively.
 - **Messages arrive in Matrix but not back to Viber** → Viber input box selector broke. Run `viber_client.py --inspect` and fix `viber_selectors.py`.
 - **Bridge hangs after Windows lock** → Windows disables UIA for locked sessions. Use `gpedit` to keep session active, or run the Windows box headless-never-locks.
+
+This project was developed with the assistance of AI tools.
