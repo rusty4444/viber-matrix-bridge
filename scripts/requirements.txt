@@ -9,5 +9,5 @@ pyyaml>=6.0.1
 uiautomation>=2.0.20
 pywinauto>=0.6.8
 pyperclip>=1.8.2
-pywin32>=306
+pywin32>=311
 psutil>=5.9.0
