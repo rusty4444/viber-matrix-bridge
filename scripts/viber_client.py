@@ -21,7 +21,6 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
 
 import pyperclip
 
@@ -29,6 +28,19 @@ try:
     import uiautomation as auto
 except ImportError:
     auto = None
+
+from viber_selectors import (
+    APP_CONTENT,
+    CHAT_STACK,
+    CONVERSATION_ROW,
+    STACKVIEW_EXACT_CLASS,
+    MESSAGE_ITEM_CLASS_PREFIX,
+    STACKVIEW_CLASS_PREFIX,
+    INPUT_BOX_CLASS_PREFIX,
+    SEARCH_BOX_CLASS_PREFIX,
+    CONVERSATION_ROW_CLASS_PREFIX,
+    OUTGOING_HINTS,
+)
 
 # UIA property IDs (from UIAutomationClient.h).
 # https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-automation-element-propids
@@ -47,29 +59,6 @@ class _UIA_RECT(ctypes.Structure):
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
     ]
-
-from viber_selectors import (
-    MAIN_WINDOW,
-    APP_CONTENT,
-    SPLIT_VIEW,
-    CHAT_STACK,
-    CHAT_INFO_PANEL,
-    SEARCH_BOX,
-    CONVERSATION_ROW,
-    MESSAGE_ITEM,
-    MESSAGE_ITEM_EXACT_CLASS,
-    STACKVIEW_EXACT_CLASS,
-    INPUT_BOX_EXACT_CLASS,
-    MESSAGE_ITEM_CLASS_PREFIX,
-    STACKVIEW_CLASS_PREFIX,
-    INPUT_BOX_CLASS_PREFIX,
-    SEARCH_BOX_CLASS_PREFIX,
-    CONVERSATION_ROW_CLASS_PREFIX,
-    INPUT_BOX,
-    SEND_BUTTON,
-    SCROLL_TO_BOTTOM,
-    OUTGOING_HINTS,
-)
 
 log = logging.getLogger("viber")
 
@@ -184,13 +173,15 @@ def _rect_from_variant(v) -> tuple[int, int, int, int] | None:
     if len(arr) != 4:
         return None
     try:
-        l = int(round(arr[0])); t = int(round(arr[1]))
-        w = int(round(arr[2])); h = int(round(arr[3]))
+        left = int(round(arr[0]))
+        t = int(round(arr[1]))
+        w = int(round(arr[2]))
+        h = int(round(arr[3]))
     except Exception:
         return None
     if w <= 0 or h <= 0:
         return None
-    return (l, t, l + w, t + h)
+    return (left, t, left + w, t + h)
 
 
 def _bounds_via_com(el) -> tuple[int, int, int, int] | None:
@@ -216,10 +207,12 @@ def _bounds_via_com(el) -> tuple[int, int, int, int] | None:
     try:
         rect = raw.CurrentBoundingRectangle
         if rect is not None:
-            l = int(rect.left); t = int(rect.top)
-            r = int(rect.right); b = int(rect.bottom)
-            if r - l > 0 and b - t > 0:
-                return (l, t, r, b)
+            left = int(rect.left)
+            t = int(rect.top)
+            r = int(rect.right)
+            b = int(rect.bottom)
+            if r - left > 0 and b - t > 0:
+                return (left, t, r, b)
     except Exception:
         pass
 
@@ -264,7 +257,8 @@ def _debug_bounds_all(el) -> str:
         if r is None:
             parts.append("wrap=None")
         else:
-            w = r.right - r.left; h = r.bottom - r.top
+            w = r.right - r.left
+            h = r.bottom - r.top
             parts.append(f"wrap=({r.left},{r.top},{r.right},{r.bottom},{w}x{h})")
     except Exception as e:
         parts.append(f"wrap!={type(e).__name__}")
@@ -335,9 +329,9 @@ def _read_bounds_live(el, retries: int = 2, settle: float = 0.05) -> tuple[int, 
         try:
             r = el.BoundingRectangle
             if r is not None:
-                l, t, rt, b = r.left, r.top, r.right, r.bottom
-                if rt - l > 0 and b - t > 0:
-                    return (l, t, rt, b)
+                left, t, rt, b = r.left, r.top, r.right, r.bottom
+                if rt - left > 0 and b - t > 0:
+                    return (left, t, rt, b)
         except Exception:
             pass
 
@@ -652,8 +646,8 @@ class ViberClient:
             return
 
         raise ViberError(
-            f"Could not find the Viber Desktop window. Is Viber running and logged in? "
-            f"Expected a WindowControl with ClassName matching 'MainWindow_QMLTYPE_\\d+'."
+            "Could not find the Viber Desktop window. Is Viber running and logged in? "
+            "Expected a WindowControl with ClassName matching 'MainWindow_QMLTYPE_\\d+'."
         )
 
     def _ensure_attached(self):
@@ -1794,7 +1788,6 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
         try:
             ctype = el.ControlTypeName
             cls   = (el.ClassName or "")
-            aid   = (el.AutomationId or "")[-50:]
             b     = el.BoundingRectangle
             bs    = f"{b.left},{b.top},{b.right-b.left}x{b.bottom-b.top}" if b else "-"
         except Exception:
@@ -1815,7 +1808,7 @@ def _inspect_chat_main(contact_name: str, max_depth: int = 8):
     stack = _native_find_prefix(c.window, "PaneControl", STACKVIEW_CLASS_PREFIX, timeout=1.0) \
             or _find(c.window, CHAT_STACK, timeout=1.0)
     if stack:
-        print(f"\n[6] StackView found! Dumping content with pattern values:")
+        print("\n[6] StackView found! Dumping content with pattern values:")
         _dump_content(stack, max_depth=6)
     else:
         print("\n[6] StackView not found by any method. Content dump skipped.")

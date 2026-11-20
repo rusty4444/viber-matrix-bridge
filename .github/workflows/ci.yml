@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install ruff pytest
+      # Pinned: unpinned ruff drifts as new rules ship (0.17.x flags 100+
+      # pre-existing patterns). Bump deliberately after clearing new debt.
+      - run: pip install ruff==0.15.20 pytest
       - run: |
           if ls scripts/requirements*.txt 2>/dev/null; then
             pip install -r scripts/requirements.txt

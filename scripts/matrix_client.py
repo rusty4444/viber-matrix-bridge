@@ -8,7 +8,6 @@ Thin wrapper around matrix-nio that handles:
 """
 
 from __future__ import annotations
-import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
@@ -17,9 +16,7 @@ from nio import (
     AsyncClientConfig,
     RoomMessageText,
     RoomCreateResponse,
-    RoomInviteResponse,
     MatrixRoom,
-    LoginResponse,
 )
 
 log = logging.getLogger("matrix")

@@ -6,8 +6,11 @@ matrix-nio==0.25.2
 aiohttp>=3.9.0
 aiosqlite>=0.19.0
 pyyaml>=6.0.1
-uiautomation>=2.0.20
-pywinauto>=0.6.8
+# Windows-only UI automation stack: the bridge drives the Viber desktop app.
+# Markers keep Windows installs identical while allowing Linux/macOS (and CI)
+# to install the cross-platform subset — pywin32 has no non-Windows wheels.
+uiautomation>=2.0.20; sys_platform == 'win32'
+pywinauto>=0.6.8; sys_platform == 'win32'
 pyperclip>=1.8.2
-pywin32>=306
+pywin32>=306; sys_platform == 'win32'
 psutil>=5.9.0
